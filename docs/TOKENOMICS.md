@@ -17,24 +17,15 @@ Access to the router's internal logic is gated by token-weighted tiers. This ens
 | **2** | Capybara | 5000000 | Opus 4.7 Extended | Access to Adaptive Effort (Max) and 128k output tokens for massive refactors. |
 | **3** | Mythos (Alpha) |250 00000 | PhD-Level / Cyber | Experimental "Capybara" leak protocols, Zero-Drift enforcement, and priority API routing. |
 
-## 2. Token Utility & "The Burn" (SOON)
+## 2. Token Utility (SOON)
 
-To maintain a sustainable ecosystem, `$MYTHOS` employs several utility-driven sinks:
-
-*   **Inference Credits:** Users can burn `$MYTHOS` to bypass traditional API subscriptions, accessing a decentralized pool of Opus 4.7 compute.
-*   **The "Drift" Penalty:** In future decentralized versions, "Reasoning Nodes" that provide hallucinated or "drifting" code results (caught by `verify`) will have their staked `$MYTHOS` slashed.
-*   **Prompt Scaffolding:** Access to the `mythos-vault`—a library of verified, high-reasoning prompt skeletons—requires a micro-transaction of `$MYTHOS`.
+MYTHOS-NEXUS TBA
 
 ## 3. Supply
 
 **Total Supply:** 100,000,000,000 `$MYTHOS`
 
-## 4. Roadmap: Token Integration
-
-*   **V1 (Q2 2026):** Token acts as a "Membership Key" (HODL to unlock CLI features).
-*   **V2 (Q3 2026):** Integration with Anthropic's "Cyber Verification" headers—using `$MYTHOS` to prove identity and intent for sensitive code audits.
-
-## 5. Contract Security
+## 4. Contract Security
 
 *   **Network:** Base (Layer 2)
 *   **CA:** `0xb942b75a602fa318ac091370d93d9143ba345ba3`
