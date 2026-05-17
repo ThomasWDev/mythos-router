@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.8.1] - 2026-05-17
+
+### Fixed
+- **SWD Rollback Drift Protection** — Rollback now uses the cached post-verification snapshot, preventing Mythos from overwriting external file changes made after verification.
+
+### Changed
+- **CI Verification Gate** — Added a GitHub Actions step to run `node dist/cli.js verify --ci` against the locally built CLI.
+- **CI Hardening** — Tightened workflow permissions and install behavior.
+
+### Security
+- **Local Data Disclosure** - Documented where Mythos stores local memory, receipts, resumable sessions, metrics, cache data, and skills so users can inspect or clear private project state.
+
+---
+
 ## [1.8.0] — 2026-05-15
 
 ### Added
@@ -294,6 +308,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Correction Turns** — max 2 retries before yielding to human.
 - **Dream/Verify Commands** — memory compression and drift detection.
 
+[1.8.1]: https://github.com/thewaltero/mythos-router/releases/tag/v1.8.1
 [1.8.0]: https://github.com/thewaltero/mythos-router/releases/tag/v1.8.0
 [1.7.1]: https://github.com/thewaltero/mythos-router/releases/tag/v1.7.1
 [1.7.0]: https://github.com/thewaltero/mythos-router/releases/tag/v1.7.0
