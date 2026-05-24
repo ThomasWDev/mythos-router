@@ -16,7 +16,9 @@
     "dist",
     "LICENSE",
     "README.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "AGENTS.md"
   ],
   "scripts": {
     "dev": "tsx src/cli.ts",
@@ -46,6 +48,11 @@
     "coding-assistant",
     "filesystem-verification",
     "strict-write-discipline"
+    "swd",
+    "external-agent",
+    "agent-verification",
+    "agent-security",
+    "byok"
   ],
   "author": "thewaltero",
   "license": "MIT",
