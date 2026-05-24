@@ -16,8 +16,7 @@ import {
   CAPYBARA_SYSTEM_PROMPT,
   MODELS,
   validateApiKey,
-  getOpenAIKey,
-  getDeepSeekKey,
+  validateProviderKeys,
   MAX_OUTPUT_TOKENS_STREAM,
   MAX_OUTPUT_TOKENS_SEND,
   type EffortLevel,
@@ -48,41 +47,41 @@ let _orchestrator: ProviderOrchestrator | null = null;
 
 export function getOrchestrator(): ProviderOrchestrator {
   if (!_orchestrator) {
-    const apiKey = validateApiKey();
+    const providers = validateProviderKeys();
     _orchestrator = new ProviderOrchestrator();
 
-    // Primary: Anthropic (always registered)
-    _orchestrator.registerProvider(
-      new AnthropicProvider(apiKey),
-      { priority: 0 },
-    );
-
-    // Fallback: OpenAI (if OPENAI_API_KEY is set)
-    const openaiKey = getOpenAIKey();
-    if (openaiKey) {
+    // Preferred default: Anthropic/Claude when configured.
+    if (providers.anthropic) {
       _orchestrator.registerProvider(
-        new OpenAIProvider({
-          id: 'openai',
-          apiKey: openaiKey,
-          baseUrl: 'https://api.openai.com/v1',
-          defaultModel: 'gpt-4o',
-        }),
-        { priority: 1 },
+        new AnthropicProvider(providers.anthropic),
+        { priority: 0 },
       );
     }
 
-    // Fallback: DeepSeek (if DEEPSEEK_API_KEY is set)
-    const deepseekKey = getDeepSeekKey();
-    if (deepseekKey) {
+    // BYOK: OpenAI can now be the only configured provider.
+    if (providers.openai) {
+      _orchestrator.registerProvider(
+        new OpenAIProvider({
+          id: 'openai',
+          apiKey: providers.openai,
+          baseUrl: 'https://api.openai.com/v1',
+          defaultModel: 'gpt-4o',
+        }),
+        { priority: providers.anthropic ? 1 : 0 },
+      );
+    }
+
+    // BYOK: DeepSeek can now be the only configured provider.
+    if (providers.deepseek) {
       _orchestrator.registerProvider(
         new OpenAIProvider({
           id: 'deepseek',
-          apiKey: deepseekKey,
+          apiKey: providers.deepseek,
           baseUrl: 'https://api.deepseek.com/v1',
           defaultModel: 'deepseek-chat',
           supportsThinking: true,
         }),
-        { priority: 2 },
+        { priority: providers.anthropic || providers.openai ? 2 : 0 },
       );
     }
   }

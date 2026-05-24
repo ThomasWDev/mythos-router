@@ -29,6 +29,7 @@ describe('CLI Smoke Tests', () => {
       assert.ok(output.includes('Usage: mythos [options] [command]'));
       assert.ok(output.includes('chat [options]'));
       assert.ok(output.includes('run [options]'));
+      assert.ok(output.includes('swd [options]'));
       assert.ok(output.includes('skills [options]'));
       assert.ok(output.includes('learn [options]'));
       assert.ok(output.includes('init [options]'));
@@ -48,6 +49,7 @@ describe('CLI Smoke Tests', () => {
       assert.ok(output.includes('[prompt...]'));
       assert.ok(output.includes('--file <path>'));
       assert.ok(output.includes('--stdin'));
+      assert.ok(output.includes('--provider <id>'));
     } catch (err: any) {
       assert.fail(
         `node dist/cli.js run --help failed: ${err.message}\n${err.stdout ?? ''}\n${err.stderr ?? ''}`,

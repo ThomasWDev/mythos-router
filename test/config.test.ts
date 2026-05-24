@@ -14,6 +14,7 @@ import {
   MEMORY_FILE,
   MEMORY_DB_FILE,
   MEMORY_MAX_LINES,
+  validateProviderKeys,
 } from '../src/config.js';
 
 
@@ -90,5 +91,48 @@ describe('Config Constants', () => {
     assert.equal(MEMORY_FILE, 'MEMORY.md');
     assert.equal(MEMORY_DB_FILE, 'memory.db');
     assert.ok(MEMORY_MAX_LINES > 0);
+  });
+});
+
+
+describe('provider key validation', () => {
+  const snapshotEnv = () => ({
+    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY,
+  });
+
+  const restoreEnv = (env: ReturnType<typeof snapshotEnv>) => {
+    for (const key of ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'DEEPSEEK_API_KEY'] as const) {
+      if (env[key] === undefined) delete process.env[key];
+      else process.env[key] = env[key];
+    }
+  };
+
+  it('accepts OpenAI-only BYOK configuration for chat/run', () => {
+    const env = snapshotEnv();
+    try {
+      delete process.env.ANTHROPIC_API_KEY;
+      process.env.OPENAI_API_KEY = 'sk-test-openai-provider';
+      delete process.env.DEEPSEEK_API_KEY;
+
+      const providers = validateProviderKeys();
+      assert.equal(providers.anthropic, null);
+      assert.equal(providers.openai, 'sk-test-openai-provider');
+    } finally {
+      restoreEnv(env);
+    }
+  });
+
+  it('still rejects invalid Anthropic key prefixes when Anthropic is configured', () => {
+    const env = snapshotEnv();
+    try {
+      process.env.ANTHROPIC_API_KEY = 'bad-prefix';
+      process.env.OPENAI_API_KEY = 'sk-test-openai-provider';
+
+      assert.throws(() => validateProviderKeys(), /Invalid ANTHROPIC_API_KEY format/);
+    } finally {
+      restoreEnv(env);
+    }
   });
 });

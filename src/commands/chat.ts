@@ -6,7 +6,7 @@ import { SWDEngine, parseActions, summarizeActions, snapshotFile, resolveSafePat
 import { printSWDResults, dryRunSWD, printVerboseParse } from '../swd-cli.js';
 import { saveSessionMetric } from '../metrics.js';
 import { appendEntry, appendMetadataBlock, needsDream, getMemoryContext, printMemoryStatus, getEntryCount } from '../memory.js';
-import { type EffortLevel, MAX_CORRECTION_RETRIES, MODELS, CAPYBARA_SYSTEM_PROMPT, validateApiKey } from '../config.js';
+import { type EffortLevel, MAX_CORRECTION_RETRIES, MODELS, CAPYBARA_SYSTEM_PROMPT, validateProviderKeys } from '../config.js';
 import { c, Spinner, BANNER, hr, error as logError, warn as logWarn, success as logSuccess, runTestCommand, confirmPrompt, renderSessionCard, renderBadgeRow, renderHelpScreen, renderExitSummary, theme, type SessionCardConfig, type ExitSummaryConfig } from '../utils.js';
 import { SessionBudget } from '../budget.js';
 import { buildSkillPrompt, type Skill } from '../skills.js';
@@ -88,8 +88,8 @@ class ChatSession {
       const skillResult = buildSkillPrompt(CAPYBARA_SYSTEM_PROMPT, skills);
       this.finalSystemPrompt = skillResult.prompt;
       this.maxOutputTokens = skillResult.maxOutputTokens;
-      this.forceProvider = skillResult.forceProvider;
-      this.allowFallback = skillResult.allowFallback;
+      this.forceProvider = options.provider ?? skillResult.forceProvider;
+      this.allowFallback = options.fallback === false ? false : skillResult.allowFallback;
       this.timeoutMs = skillResult.timeoutMs;
       this.activeSkills = skillResult.skills;
       budgetMultiplier = skillResult.budgetMultiplier;
@@ -863,6 +863,8 @@ interface ChatOptions {
   testCmd?: string;
   maxTestRetries?: string;
   skill?: string | string[];
+  provider?: string;
+  fallback?: boolean;
   resume?: boolean;
 }
 
@@ -877,7 +879,7 @@ interface ReceiptContext {
 }
 
 export async function chatCommand(options: ChatOptions): Promise<void> {
-  validateApiKey();
+  validateProviderKeys();
   const ui = new TerminalUI(new Spinner());
   const session = new ChatSession(options, ui);
 
@@ -1066,7 +1068,7 @@ export async function runCommand(prompt: string, options: RunOptions): Promise<v
     return;
   }
 
-  validateApiKey();
+  validateProviderKeys();
   const runOptions = normalizeRunOptions(options);
   const ui = new TerminalUI(new Spinner());
   const session = new ChatSession(runOptions, ui);

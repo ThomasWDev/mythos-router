@@ -54,18 +54,19 @@ Zero slop. Zero hallucinated state. Full adaptive thinking.
 |---------|-------------|
 |  **mythos init** | Single-command project onboarding with environment validation, read-only `--check`, and scaffolding |
 |  **mythos learn** | Generate a repo-local `SKILL.md` from detected project structure, scripts, docs, CI, and risk surfaces |
-|  **mythos run** | One-shot prompt mode with inline, file, or stdin input: same SWD, budget, skills, branch, and optional test-healing pipeline as chat |
-|  **Multi-Provider Fallback** | Auto-routes between Anthropic, DeepSeek, and OpenAI with circuit breakers |
+|  **mythos run** | One-shot prompt mode with inline, file, stdin input, and optional `--provider` BYOK selection: same SWD, budget, skills, branch, and optional test-healing pipeline as chat |
+|  **Multi-Provider BYOK** | Auto-routes between configured Anthropic, DeepSeek, and OpenAI keys with circuit breakers; Anthropic is no longer required when another provider is configured |
 |  **Verified Skill Packs** | Load project-local or user-global `SKILL.md` rules with `-s <name>`; active skills are recorded in SWD receipts |
 |  **Deterministic Caching** | SQLite-backed caching for reasoning (SDK only) *(Node 22+)* |
 |  **Adaptive Thinking** | Opus 4.7 with configurable effort levels (high/medium/low) |
-|  **Strict Write Discipline** | Pre/post filesystem snapshots verify every model claim |
-|  **SWD Receipts** | Per-run trust receipts record touched files, hashes, provider, budget, git state, and verification result |
+|  **Strict Write Discipline** | Pre/post filesystem snapshots verify every model or external-agent file claim |
+|  **SWD Receipts** | Per-run trust receipts record touched files, hashes, provider/external-agent id, budget, git state, and verification result |
 |  **Self-Healing Memory** | Authority-based logging with a rebuildable SQLite FTS5 search index *(Node 22+)* |
 |  **Auto-Healing TDD** | Pass `--test-cmd` for bounded, error-driven autonomous repair loops |
 |  **Correction Turns** | Model gets 2 retries to match filesystem reality, then yields |
 |  **Integrity Gate** | `verify` command ensures referenced memory files still exist |
 |  **CI Verification** | `verify --ci` runs read-only PR checks for command-surface, sensitive-file, and receipt risks without an API key |
+|  **Bring Your Own Agent** | `mythos swd apply --stdin --json` lets any external agent route file actions through SWD without a Mythos model key |
 |  **Token Limiter** | Budget cap with graceful save — progress saved to MEMORY.md, never lose work |
 |  **Session Resume** | Pick up exactly where you left off after a crash or exit (`--resume`) |
 |  **Dry-Run Mode** | Preview every file operation before it executes — full transparency |
@@ -108,14 +109,18 @@ As memory approaches capacity, the `dream` command delegates a compression phase
 # Install globally
 npm install -g mythos-router
 
-# Set your API keys (Anthropic is primary, others are fallbacks)
+# Set at least one model key for mythos chat/run
+# Anthropic remains the recommended default, but OpenAI/DeepSeek can be used standalone.
 export ANTHROPIC_API_KEY="sk-ant-..."
-export OPENAI_API_KEY="sk-proj-..."
-export DEEPSEEK_API_KEY="sk-..."
+# export OPENAI_API_KEY="sk-proj-..."
+# export DEEPSEEK_API_KEY="sk-..."
 
-# Initialize and start
+# Initialize and start the built-in Mythos agent
 mythos init
 mythos chat
+
+# Or use only the model-free SWD layer with your own external agent
+your-agent --emit-file-actions | mythos swd apply --stdin --json
 ```
 
 ### Or try without installing
@@ -183,6 +188,7 @@ When a non-dry-run SWD operation creates a receipt, Mythos records the active sk
 mythos run "explain this repo architecture"
 mythos run --file TASK.md
 cat TASK.md | mythos run --stdin
+mythos run --provider openai "explain this repo architecture"
 mythos run "update the docs for verify --ci" --dry-run
 mythos run "fix the failing smoke test" --test-cmd "npm test"
 mythos run "refactor provider scoring" --branch provider-score
@@ -196,8 +202,9 @@ mythos run "refactor provider scoring" --branch provider-score
 mythos chat                  # Full power (high effort, Opus 4.7)
 mythos chat -s repo          # Load a project-local skill pack
 mythos chat --test-cmd "npm test" # Enable autonomous test-driven self-healing
-mythos chat --effort low     # Budget mode (Haiku 4.5)
-mythos chat --effort medium  # Balanced (Sonnet 4.6)
+mythos chat --provider openai # Force a configured BYOK provider
+mythos chat --effort low     # Budget mode (Haiku 4.5 when using Claude)
+mythos chat --effort medium  # Balanced (Sonnet 4.6 when using Claude)
 mythos chat --resume         # Resume your previous session exactly where you left off
 mythos chat --dry-run        # Preview all file changes before executing
 mythos chat --verbose        # See full SWD traces and thinking
@@ -251,6 +258,62 @@ In dry-run mode, every file operation is previewed before execution:
 In-session commands:
 - `/exit`, `/q` or `quit` — End session (shows final budget summary)
 
+### `mythos swd apply` — Bring Your Own Agent
+
+```bash
+# Pipe raw [FILE_ACTION] blocks from any external agent
+your-agent --task "update docs" | mythos swd apply --stdin --json
+
+# Or pass a JSON action envelope
+cat actions.json | mythos swd apply --stdin --json --agent python-agent --model local-llama
+
+# Preview without touching disk or writing receipts
+cat actions.json | mythos swd apply --stdin --dry-run --json
+
+# High-impact files such as package.json require explicit opt-in; sensitive files stay blocked
+cat actions.json | mythos swd apply --stdin --allow-risky --json
+```
+
+`swd apply` is the model-free external-agent interface. It does **not** call Anthropic, OpenAI, DeepSeek, or any other model provider. Your agent keeps its own model key and only hands Mythos structured file actions. Mythos then applies Strict Write Discipline: path validation, security-policy review, pre/post snapshots, hash verification, rollback on failed verification, and local SWD receipts for successful non-dry-run applies.
+
+Accepted input formats:
+
+```text
+[FILE_ACTION: src/example.ts]
+OPERATION: CREATE | MODIFY | DELETE | READ
+INTENT: MUTATE | NOOP | UNKNOWN
+CONTENT_HASH: <optional sha256 of final content>
+DESCRIPTION: <one-line summary>
+CONTENT:
+<full file content for CREATE/MODIFY>
+[/FILE_ACTION]
+```
+
+```json
+{
+  "request": "external agent task label",
+  "summary": "CREATE: src/example.ts",
+  "agent": { "id": "python-agent", "model": "custom-model" },
+  "actions": [
+    {
+      "path": "src/example.ts",
+      "operation": "CREATE",
+      "intent": "MUTATE",
+      "description": "Create example file",
+      "content": "export const ok = true;\n"
+    }
+  ]
+}
+```
+
+Security defaults:
+- input is size-limited and schema-validated before execution
+- external JSON paths must be safe project-relative paths
+- `.env`, private keys, wallet files, `.git`, `.npmrc`, and secrets paths are blocked
+- deletes and command-surface files require `--allow-risky`
+- dry-runs do not write files or receipts
+- receipts record the external agent/model as `external:<agent-id>`
+
 ### `mythos receipts` — SWD Trust Receipts
 
 ```bash
@@ -260,7 +323,7 @@ mythos receipts verify latest  # Re-check current files against receipt hashes
 mythos receipts --json       # Machine-readable output for tooling
 ```
 
-Every non-dry-run SWD file operation writes a local receipt to `.mythos/receipts/`. Receipts include the user request summary, provider/model, token usage, budget snapshot, active skill packs, git branch/commit, per-file before/after hashes, rollback status, and optional `--test-cmd` result. `verify` turns those receipts into a quick drift check for "did the files still match what SWD verified?" Receipts are local by default and gitignored by default. They may include prompts, file paths, provider metadata, skill names, test command names, and a short test output tail. Do not publish raw receipts from private repositories; force-add only when you intentionally want a shared audit trail.
+Every non-dry-run SWD file operation writes a local receipt to `.mythos/receipts/`. Receipts include the request summary, provider or external-agent/model identity, git branch/commit, per-file before/after hashes, rollback status, and verification errors. Built-in `chat`/`run` receipts also include token usage, budget snapshot, active skill packs, and optional `--test-cmd` result. `verify` turns those receipts into a quick drift check for "did the files still match what SWD verified?" Receipts are local by default and gitignored by default. They may include prompts, file paths, provider metadata, skill names, test command names, and a short test output tail. Do not publish raw receipts from private repositories; force-add only when you intentionally want a shared audit trail.
 
 ### `mythos verify` — Local Memory Scan + CI Verification
 
@@ -366,7 +429,7 @@ mythos-router/
 ├── src/
 │   ├── cli.ts           # Commander.js entry point
 │   ├── config.ts        # System prompt + constants + budget defaults + validation
-│   ├── client.ts        # Anthropic SDK (adaptive thinking, streaming)
+│   ├── client.ts        # Provider facade (Anthropic/OpenAI/DeepSeek BYOK routing)
 │   ├── budget.ts        # Session budget limiter (token cap, turn cap, progress bar)
 │   ├── swd.ts           # SWD execution kernel (engine, types, parsing, snapshots)
 │   ├── swd-cli.ts       # SWD terminal presentation (verification output, dry-run)
@@ -384,6 +447,7 @@ mythos-router/
 │       ├── chat.ts      # Interactive REPL (ChatSession + ChatUI abstraction)
 │       ├── init.ts      # Project onboarding and read-only setup checks
 │       ├── verify.ts    # Codebase ↔ Memory scanner (dry-run aware)
+│       ├── swd.ts       # External-agent SWD apply command
 │       ├── receipts.ts  # SWD receipt list/show/verify command
 │       ├── skills.ts    # Skill pack list/show/new/check command
 │       ├── learn.ts     # Repo skill generation command
@@ -442,9 +506,11 @@ If you prefer to keep it private, add `MEMORY.md` to your `.gitignore`.
 
 | Env Variable | Required | Description |
 |-------------|----------|-------------|
-| `ANTHROPIC_API_KEY` | ✅ | Your Anthropic API key (Primary Provider) |
-| `OPENAI_API_KEY` | ❌ | OpenAI API Key (Fallback Provider) |
-| `DEEPSEEK_API_KEY` | ❌ | DeepSeek API Key (Fallback Provider, reasoning capable) |
+| `ANTHROPIC_API_KEY` | Optional* | Anthropic/Claude key; recommended default provider for `chat`/`run` |
+| `OPENAI_API_KEY` | Optional* | OpenAI API key; can be used as the only configured provider or fallback |
+| `DEEPSEEK_API_KEY` | Optional* | DeepSeek API key; can be used as the only configured provider or fallback |
+
+\* `mythos chat` and `mythos run` need at least one model provider key. `mythos swd apply` needs no model key because an external agent brings its own model/key and Mythos only verifies file actions.
 
 | File | Purpose |
 |------|---------| 

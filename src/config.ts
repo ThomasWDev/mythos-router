@@ -120,9 +120,23 @@ export function getEffort(flag?: string): EffortLevel {
 }
 
 // ── Validation ───────────────────────────────────────────────
-export function validateApiKey(): string {
+export function getAnthropicKey(): string | null {
   const key = process.env.ANTHROPIC_API_KEY;
-  if (!key || typeof key !== 'string') {
+  if (!key || typeof key !== 'string' || key.trim().length === 0) return null;
+
+  const trimmed = key.trim();
+  if (!trimmed.startsWith('sk-ant-')) {
+    throw new Error(
+      'Invalid ANTHROPIC_API_KEY format. Expected prefix: sk-ant-...\n'
+    );
+  }
+
+  return trimmed;
+}
+
+export function validateApiKey(): string {
+  const key = getAnthropicKey();
+  if (!key) {
     throw new Error(
       'ANTHROPIC_API_KEY not set.\n' +
       '  Set it:  export ANTHROPIC_API_KEY="sk-ant-..."\n' +
@@ -130,13 +144,7 @@ export function validateApiKey(): string {
     );
   }
 
-  if (!key.startsWith('sk-ant-')) {
-    throw new Error(
-      'Invalid ANTHROPIC_API_KEY format. Expected prefix: sk-ant-...\n'
-    );
-  }
-
-  return key.trim();
+  return key;
 }
 
 // ── Multi-Provider API Key Helpers ───────────────────────────
@@ -161,8 +169,28 @@ export interface AvailableProviders {
 
 export function detectProviders(): AvailableProviders {
   return {
+    // Detection is intentionally non-throwing for init/status UIs.
+    // Runtime validation still happens in validateProviderKeys().
     anthropic: process.env.ANTHROPIC_API_KEY?.trim() || null,
     openai: getOpenAIKey(),
     deepseek: getDeepSeekKey(),
   };
+}
+
+export function validateProviderKeys(): AvailableProviders {
+  const providers: AvailableProviders = {
+    anthropic: getAnthropicKey(),
+    openai: getOpenAIKey(),
+    deepseek: getDeepSeekKey(),
+  };
+  if (!providers.anthropic && !providers.openai && !providers.deepseek) {
+    throw new Error(
+      'No model provider API key set. Configure at least one provider for mythos chat/run:\n' +
+      '  ANTHROPIC_API_KEY="sk-ant-..."     # Claude / recommended default\n' +
+      '  OPENAI_API_KEY="sk-..."            # OpenAI-compatible fallback\n' +
+      '  DEEPSEEK_API_KEY="..."             # DeepSeek fallback\n' +
+      'Note: mythos swd apply does not require any model API key.'
+    );
+  }
+  return providers;
 }

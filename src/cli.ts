@@ -28,6 +28,7 @@ import { initCommand } from './commands/init.js';
 import { receiptsCommand } from './commands/receipts.js';
 import { skillsCommand } from './commands/skills.js';
 import { learnCommand } from './commands/learn.js';
+import { swdCommand } from './commands/swd.js';
 import {
   DEFAULT_MAX_TOKENS_PER_SESSION,
   DEFAULT_MAX_TURNS,
@@ -114,6 +115,14 @@ program
     'Load verified skill packs (e.g., -s repo -s security-review)',
   )
   .option(
+    '--provider <id>',
+    'Force provider for chat/run: anthropic, openai, or deepseek',
+  )
+  .option(
+    '--no-fallback',
+    'Disable provider fallback for this session',
+  )
+  .option(
     '--resume',
     'Resume the last saved session (history + budget state)',
   )
@@ -175,7 +184,33 @@ program
     '-s, --skill <names...>',
     'Load verified skill packs (e.g., -s repo -s security-review)',
   )
+  .option(
+    '--provider <id>',
+    'Force provider for chat/run: anthropic, openai, or deepseek',
+  )
+  .option(
+    '--no-fallback',
+    'Disable provider fallback for this run',
+  )
   .action((prompt: string[] | undefined, options: Parameters<typeof runCommand>[1]) => runCommand((prompt ?? []).join(' '), options));
+
+// ── mythos swd ───────────────────────────────────────────────
+program
+  .command('swd')
+  .description('Apply external-agent file actions through model-free Strict Write Discipline')
+  .argument('[action]', 'apply', 'apply')
+  .option('--stdin', 'Read external-agent FILE_ACTION or JSON input from stdin')
+  .option('--file <path>', 'Read external-agent FILE_ACTION or JSON input from a file')
+  .option('--json', 'Print machine-readable JSON output')
+  .option('--dry-run', 'Verify the plan without writing files or receipts')
+  .option('--no-rollback', 'Disable rollback on failed verification')
+  .option('--no-receipt', 'Do not save a SWD receipt')
+  .option('--allow-risky', 'Allow high-impact actions that normally require human confirmation; sensitive files remain blocked')
+  .option('--request <text>', 'Receipt request label for external-agent runs')
+  .option('--summary <text>', 'Receipt summary override')
+  .option('--agent <id>', 'External agent identifier for receipts')
+  .option('--model <id>', 'External agent model identifier for receipts')
+  .action(swdCommand);
 
 // ── mythos verify ────────────────────────────────────────────
 program

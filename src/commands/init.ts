@@ -93,7 +93,7 @@ function checkProviders(): ProviderCheck[] {
       name: 'Anthropic (Claude)',
       ok: !!detected.anthropic,
       envVar: 'ANTHROPIC_API_KEY',
-      required: true,
+      required: false,
     },
     {
       name: 'OpenAI (GPT)',
@@ -294,7 +294,7 @@ export async function initCommand(options: InitOptions): Promise<void> {
   // Status line
   const statusLabel = checkOnly && missing > 0
     ? `${c.yellow}setup incomplete${c.reset}`
-    : !anthropicMissing ? `${c.green}ready${c.reset}` : `${c.yellow}ready (ANTHROPIC_API_KEY not set)${c.reset}`;
+    : hasAnyProvider ? `${c.green}ready${c.reset}` : `${c.yellow}ready for swd apply only (no model key set)${c.reset}`;
   console.log(`  ${c.dim}Status:${c.reset} ${statusLabel}`);
 
   console.log();
@@ -307,6 +307,7 @@ export async function initCommand(options: InitOptions): Promise<void> {
   console.log(`  ${c.dim}$${c.reset} ${c.bold}mythos run "..."${c.reset}      ${c.dim}Run one prompt and exit${c.reset}`);
   console.log(`  ${c.dim}$${c.reset} ${c.bold}mythos chat${c.reset}           ${c.dim}Start an interactive session${c.reset}`);
   console.log(`  ${c.dim}$${c.reset} ${c.bold}mythos chat --dry-run${c.reset}  ${c.dim}Preview changes without applying${c.reset}`);
+  console.log(`  ${c.dim}$${c.reset} ${c.bold}mythos swd apply --stdin --json${c.reset} ${c.dim}Verify external-agent file actions without a model key${c.reset}`);
   console.log(`  ${c.dim}$${c.reset} ${c.bold}mythos verify${c.reset}         ${c.dim}Scan codebase for memory drift${c.reset}`);
   console.log(`  ${c.dim}$${c.reset} ${c.bold}mythos providers${c.reset}      ${c.dim}View provider health dashboard${c.reset}`);
   console.log();

@@ -112,7 +112,9 @@ export {
 export { SessionBudget, type BudgetConfig, type BudgetCheck, type BudgetSnapshot } from './budget.js';
 
 // Export Core Config & Models
-export { MODELS, CAPYBARA_SYSTEM_PROMPT, getEffort, validateApiKey, type EffortLevel } from './config.js';
+export { MODELS, CAPYBARA_SYSTEM_PROMPT, getEffort, validateApiKey, validateProviderKeys, type EffortLevel } from './config.js';
 
 // Export the Chat UI Interface (for custom frontends)
 export { type ChatUI } from './commands/chat.js';
+
+export { parseExternalAgentInput, applyExternalAgentActions, type ExternalAgentInput, type SWDApplyResult } from './commands/swd.js';
