@@ -106,23 +106,23 @@ export function ensureSkillsDir(scope: Exclude<SkillScope, 'path'> = 'global', c
 }
 
 function parseFrontmatter(content: string): { meta: Record<string, unknown>; body: string } {
-  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
-  if (!match) {
+  const sections = parseFrontmatterSections(content);
+  if (!sections) {
     return { meta: {}, body: content.trim() };
   }
 
-  const yamlBlock = match[1];
-  const body = match[2].trim();
+  const { yamlBlock, body } = sections;
   const meta: Record<string, unknown> = {};
 
   let currentKey: string | null = null;
   let currentArray: string[] | null = null;
 
   for (const rawLine of yamlBlock.split('\n')) {
-    const line = rawLine.replace(/\r$/, '');
+    const line = stripTrailingCarriageReturn(rawLine);
 
-    if (/^\s+-\s+/.test(line) && currentKey && currentArray) {
-      const value = line.replace(/^\s+-\s+/, '').trim();
+    const arrayItem = parseYamlArrayItem(line);
+    if (arrayItem !== null && currentKey && currentArray) {
+      const value = arrayItem.trim();
       currentArray.push(String(parseYamlValue(value)));
       continue;
     }
@@ -135,11 +135,10 @@ function parseFrontmatter(content: string): { meta: Record<string, unknown>; bod
 
     if (line.trim().startsWith('#') || line.trim() === '') continue;
 
-    const kvMatch = line.match(/^([a-zA-Z_-]+):\s*(.*)$/);
-    if (!kvMatch) continue;
+    const parsed = parseYamlKeyValue(line);
+    if (!parsed) continue;
 
-    const key = kvMatch[1].trim();
-    const rawValue = kvMatch[2].trim();
+    const { key, rawValue } = parsed;
 
     if (rawValue === '' || rawValue === undefined) {
       currentKey = key;
@@ -157,11 +156,115 @@ function parseFrontmatter(content: string): { meta: Record<string, unknown>; bod
   return { meta, body };
 }
 
+function parseFrontmatterSections(content: string): { yamlBlock: string; body: string } | null {
+  const lines = content.split('\n');
+  if (lines.length === 0 || stripTrailingCarriageReturn(lines[0]!) !== '---') {
+    return null;
+  }
+
+  for (let index = 1; index < lines.length; index++) {
+    if (stripTrailingCarriageReturn(lines[index]!) === '---') {
+      return {
+        yamlBlock: lines.slice(1, index).join('\n'),
+        body: lines.slice(index + 1).join('\n').trim(),
+      };
+    }
+  }
+
+  return null;
+}
+
+function stripTrailingCarriageReturn(line: string): string {
+  return line.endsWith('\r') ? line.slice(0, -1) : line;
+}
+
+function parseYamlArrayItem(line: string): string | null {
+  let index = 0;
+  while (index < line.length && isYamlWhitespace(line[index]!)) index++;
+
+  if (line[index] !== '-') return null;
+  index++;
+
+  if (index >= line.length || !isYamlWhitespace(line[index]!)) return null;
+  while (index < line.length && isYamlWhitespace(line[index]!)) index++;
+
+  return line.slice(index);
+}
+
+function parseYamlKeyValue(line: string): { key: string; rawValue: string } | null {
+  const colonIndex = line.indexOf(':');
+  if (colonIndex <= 0) return null;
+
+  const key = line.slice(0, colonIndex);
+  if (!isYamlMetaKey(key)) return null;
+
+  return {
+    key,
+    rawValue: line.slice(colonIndex + 1).trim(),
+  };
+}
+
+function isYamlMetaKey(key: string): boolean {
+  for (const char of key) {
+    const code = char.charCodeAt(0);
+    const isUpper = code >= 65 && code <= 90;
+    const isLower = code >= 97 && code <= 122;
+    if (!isUpper && !isLower && char !== '_' && char !== '-') {
+      return false;
+    }
+  }
+  return key.length > 0;
+}
+
+function isYamlWhitespace(char: string): boolean {
+  return char === ' ' || char === '\t';
+}
+
 function parseYamlValue(raw: string): string | number | boolean {
   if (raw === 'true') return true;
   if (raw === 'false') return false;
-  if (/^-?\d+(\.\d+)?$/.test(raw)) return parseFloat(raw);
-  return raw.replace(/^["']|["']$/g, '');
+
+  const numberValue = parseYamlNumber(raw);
+  if (numberValue !== null) return numberValue;
+
+  return stripWrappingQuotes(raw);
+}
+
+function parseYamlNumber(raw: string): number | null {
+  let index = raw.startsWith('-') ? 1 : 0;
+  let hasIntegerDigits = false;
+
+  while (index < raw.length && isDigit(raw[index]!)) {
+    hasIntegerDigits = true;
+    index++;
+  }
+
+  if (index < raw.length && raw[index] === '.') {
+    index++;
+    let hasFractionDigits = false;
+    while (index < raw.length && isDigit(raw[index]!)) {
+      hasFractionDigits = true;
+      index++;
+    }
+    if (!hasFractionDigits) return null;
+  }
+
+  if (!hasIntegerDigits || index !== raw.length) return null;
+  return Number(raw);
+}
+
+function stripWrappingQuotes(raw: string): string {
+  const first = raw[0];
+  const last = raw[raw.length - 1];
+  if ((first === '"' || first === "'") && first === last) {
+    return raw.slice(1, -1);
+  }
+  return raw;
+}
+
+function isDigit(char: string): boolean {
+  const code = char.charCodeAt(0);
+  return code >= 48 && code <= 57;
 }
 
 function isPathLike(nameOrPath: string): boolean {
