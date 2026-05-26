@@ -6,6 +6,7 @@
 import { c, dryRunBadge, verboseBadge, confirmPrompt, theme, icon } from './utils.js';
 import { renderDiff } from './diff.js';
 import { parseActions, snapshotFile, type FileAction, type SWDRunResult } from './swd.js';
+import { reviewActions } from './security-policy.js';
 
 // ── Print verification results to terminal ───────────────────
 export function printSWDResults(result: SWDRunResult): void {
@@ -33,11 +34,25 @@ export async function dryRunSWD(actions: FileAction[]): Promise<{ accepted: File
   console.log(`\n${dryRunBadge()} ${c.bold}── File Action Preview ──${c.reset}\n`);
   const accepted: FileAction[] = [];
   const rejected: FileAction[] = [];
+  const review = reviewActions(actions);
   for (let i = 0; i < actions.length; i++) {
     const action = actions[i]!;
+    const blocked = review.blocked.find((item) => item.action === action);
+    if (blocked) {
+      console.log(`  ${c.bold}${i + 1}/${actions.length}${c.reset} ${c.cyan}${action.operation}${c.reset} ${action.path}`);
+      console.log(`  ${theme.error}${icon.error}${c.reset} Blocked by policy: ${blocked.verdict.reason}`);
+      rejected.push(action);
+      console.log();
+      continue;
+    }
+
+    const needsConfirmation = review.needsConfirmation.find((item) => item.action === action);
     const snap = snapshotFile(action.path);
     console.log(`  ${c.bold}${i + 1}/${actions.length}${c.reset} ${c.cyan}${action.operation}${c.reset} ${action.path}`);
     console.log(`  ${c.dim}Intent: ${action.intent} | ${action.description}${c.reset}`);
+    if (needsConfirmation) {
+      console.log(`  ${theme.warning}${icon.warning}${c.reset} ${needsConfirmation.verdict.reason}`);
+    }
     if (action.content && (action.operation === 'MODIFY' || action.operation === 'CREATE')) {
       const old = snap.exists && snap.content ? snap.content.toString() : '';
       console.log(renderDiff(old, action.content));

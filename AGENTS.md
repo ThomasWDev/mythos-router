@@ -6,6 +6,8 @@
 - **Stack**: TypeScript on Node.js 20+ (ESM, `tsx` for dev)
 
 ## Architecture
+- `src/mcp-config.ts` — Paste-ready MCP client configuration helper
+- `src/project-policy.ts` — Repo-local `.mythos/policy.json` loader and matcher
 - `src/cli.ts` — Commander.js entry point
 - `src/config.ts` — Constants, system prompt, validation, budget defaults
 - `src/client.ts` — Provider facade and Anthropic direct-client compatibility path
@@ -48,6 +50,8 @@
 - In `--dry-run` mode, actions are previewed and must not mutate files or write receipts.
 
 ## External Agent SWD Protocol
+- `.mythos/policy.json` is an enforced repo-local SWD policy. It can add blocks, confirmations, delete controls, operation allowlists, action batch limits, and write-size limits. Malformed policy files must fail closed.
+- `mythos mcp config [generic|claude|cursor]` prints client config only. It must not start the MCP server, write files, call a model, or open a port.
 - `mythos swd apply --stdin --json` is the model-free integration point for external/autonomous agents.
 - `mythos mcp` exposes the same boundary to MCP-compatible clients over stdio; it must not start a daemon, open a port, or duplicate SWD logic.
 - It must not require `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `DEEPSEEK_API_KEY`; the external agent brings its own model/key.

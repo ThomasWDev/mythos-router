@@ -21,6 +21,37 @@ describe('SessionBudget', () => {
     assert.equal(snap.maxTurns, 10);
   });
 
+  it('falls back to defaults for invalid budget limits', () => {
+    const budget = new SessionBudget({
+      maxTokens: 0,
+      maxTurns: -5,
+      warnAtPercent: Number.NaN,
+    });
+    const snap = budget.status();
+    const check = budget.check();
+
+    assert.equal(snap.maxTokens, 500_000);
+    assert.equal(snap.maxTurns, 25);
+    assert.equal(Number.isFinite(check.tokensPercent), true);
+    assert.equal(Number.isFinite(check.turnsPercent), true);
+  });
+
+  it('sanitizes non-finite and negative restored usage', () => {
+    const budget = new SessionBudget();
+
+    budget.restore(Number.NaN, -100, Number.POSITIVE_INFINITY);
+    let snap = budget.status();
+    assert.equal(snap.inputTokens, 0);
+    assert.equal(snap.outputTokens, 0);
+    assert.equal(snap.turns, 0);
+
+    budget.record(Number.NaN, -50);
+    snap = budget.status();
+    assert.equal(snap.inputTokens, 0);
+    assert.equal(snap.outputTokens, 0);
+    assert.equal(snap.turns, 1);
+  });
+
 
   it('records token usage correctly', () => {
     const budget = new SessionBudget();

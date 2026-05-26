@@ -14,6 +14,7 @@ import {
   sanitizeReceiptOutputTail,
   RECEIPT_OUTPUT_TAIL_MAX_CHARS,
 } from '../src/receipts.js';
+import { formatReceiptMarkdown } from '../src/receipt-markdown.js';
 import type { SWDRunResult } from '../src/swd.js';
 
 const originalCwd = process.cwd();
@@ -246,6 +247,89 @@ Authorization: Bearer ${'y'.repeat(40)}
     assert.doesNotMatch(tail, /sk-proj-/);
     assert.doesNotMatch(tail, /Bearer y/);
     assert.match(tail, /\[REDACTED_SECRET\]/);
+  });
+
+  it('formats failed receipts as PR-ready markdown', () => {
+    const filePath = 'failed.txt';
+    const absPath = join(tempDir, filePath);
+
+    const receipt = createSWDReceipt({
+      request: 'external agent failed write',
+      summary: 'MODIFY: failed.txt',
+      provider: {
+        providerId: 'external:review-agent',
+        modelId: 'manual',
+      },
+      git: {
+        branch: 'main',
+        commit: '91f4c2a8d3b1',
+      },
+      result: {
+        success: false,
+        rolledBack: true,
+        rollbackErrors: [],
+        errors: ['Hash mismatch after write'],
+        results: [
+          {
+            action: {
+              path: filePath,
+              operation: 'MODIFY',
+              intent: 'MUTATE',
+              description: 'Update failed file',
+            },
+            status: 'drift',
+            detail: `Hash mismatch after MODIFY ${filePath}`,
+            before: {
+              path: absPath,
+              exists: true,
+              size: 6,
+              mtime: 1,
+              hash: sha256('before'),
+            },
+            after: {
+              path: absPath,
+              exists: true,
+              size: 5,
+              mtime: 2,
+              hash: sha256('after'),
+            },
+          },
+        ],
+      },
+    });
+
+    const markdown = formatReceiptMarkdown(receipt);
+
+    assert.match(markdown, /### Mythos SWD Receipt/);
+    assert.match(markdown, /\| Status \| failed \(rolled back\) \|/);
+    assert.match(markdown, /\| Provider \| `external:review-agent\/manual` \|/);
+    assert.match(markdown, /\| drift \| MODIFY \| `failed\.txt` \|/);
+    assert.match(markdown, /#### SWD Errors/);
+    assert.match(markdown, /Hash mismatch after write/);
+    assert.match(markdown, new RegExp(`mythos receipts verify ${receipt.id}`));
+  });
+
+  it('escapes receipt markdown code spans without leaving backslash escape gaps', () => {
+    const receipt = createSWDReceipt({
+      request: 'format markdown edge cases',
+      summary: 'CREATE: text\\slash|pipe',
+      provider: {
+        providerId: 'external:agent\\with`tick|pipe',
+        modelId: 'manual\\model`pipe|',
+      },
+      result: {
+        success: true,
+        rolledBack: false,
+        rollbackErrors: [],
+        errors: [],
+        results: [],
+      },
+    });
+
+    const markdown = formatReceiptMarkdown(receipt);
+
+    assert.ok(markdown.includes('| Summary | CREATE: text\\\\slash\\|pipe |'));
+    assert.ok(markdown.includes('| Provider | `external:agent\\\\with\\`tick\\|pipe/manual\\\\model\\`pipe\\|` |'));
   });
 
 });

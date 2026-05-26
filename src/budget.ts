@@ -46,6 +46,32 @@ export interface BudgetSnapshot {
   estimatedCostUSD: number;
 }
 
+function positiveIntegerOrDefault(value: number | undefined, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    return fallback;
+  }
+  return Math.floor(value);
+}
+
+function percentOrDefault(value: number | undefined, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value > 100) {
+    return fallback;
+  }
+  return value;
+}
+
+function nonNegativeFiniteOrDefault(value: number | undefined, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    return fallback;
+  }
+  return value;
+}
+
+function nonNegativeIntegerOrZero(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.floor(value);
+}
+
 // ── Session Budget Class ─────────────────────────────────────
 export class SessionBudget {
   private config: BudgetConfig;
@@ -57,11 +83,11 @@ export class SessionBudget {
 
   constructor(config?: Partial<BudgetConfig>, enabled = true) {
     this.config = {
-      maxTokens: config?.maxTokens ?? DEFAULT_MAX_TOKENS_PER_SESSION,
-      maxTurns: config?.maxTurns ?? DEFAULT_MAX_TURNS,
-      warnAtPercent: config?.warnAtPercent ?? BUDGET_WARN_PERCENT,
-      costPerInputToken: config?.costPerInputToken ?? COST_PER_INPUT_TOKEN,
-      costPerOutputToken: config?.costPerOutputToken ?? COST_PER_OUTPUT_TOKEN,
+      maxTokens: positiveIntegerOrDefault(config?.maxTokens, DEFAULT_MAX_TOKENS_PER_SESSION),
+      maxTurns: positiveIntegerOrDefault(config?.maxTurns, DEFAULT_MAX_TURNS),
+      warnAtPercent: percentOrDefault(config?.warnAtPercent, BUDGET_WARN_PERCENT),
+      costPerInputToken: nonNegativeFiniteOrDefault(config?.costPerInputToken, COST_PER_INPUT_TOKEN),
+      costPerOutputToken: nonNegativeFiniteOrDefault(config?.costPerOutputToken, COST_PER_OUTPUT_TOKEN),
     };
     this.startedAt = Date.now();
     this.enabled = enabled;
@@ -69,16 +95,16 @@ export class SessionBudget {
 
   // ── Record token usage after an API call ─────────────────
   record(inputTokens: number, outputTokens: number): void {
-    this.totalInput += inputTokens;
-    this.totalOutput += outputTokens;
+    this.totalInput += nonNegativeIntegerOrZero(inputTokens);
+    this.totalOutput += nonNegativeIntegerOrZero(outputTokens);
     this.turnCount++;
   }
 
   // ── Restore state from a saved session ───────────────────
   restore(inputTokens: number, outputTokens: number, turns: number): void {
-    this.totalInput = inputTokens;
-    this.totalOutput = outputTokens;
-    this.turnCount = turns;
+    this.totalInput = nonNegativeIntegerOrZero(inputTokens);
+    this.totalOutput = nonNegativeIntegerOrZero(outputTokens);
+    this.turnCount = nonNegativeIntegerOrZero(turns);
   }
 
   // ── Check if budget is still ok ──────────────────────────
@@ -222,7 +248,6 @@ export class SessionBudget {
     );
   }
 }
-
 
 
 

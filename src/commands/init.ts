@@ -2,16 +2,17 @@
 //  mythos-router :: commands/init.ts
 //  Project initialization — single-command onboarding
 //
-//  Creates .mythosignore, MEMORY.md, skills directory.
+//  Creates .mythosignore, MEMORY.md, skills directory, and project policy.
 //  Validates environment, detects providers, prints next steps.
 // ─────────────────────────────────────────────────────────────
 
-import { existsSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { c, BANNER, hr, heading, success, warn, error as logError } from '../utils.js';
-import { DEFAULT_IGNORE_PATTERNS, MYTHOSIGNORE_FILE, detectProviders } from '../config.js';
+import { DEFAULT_IGNORE_PATTERNS, MYTHOSIGNORE_FILE, PROJECT_POLICY_FILE, detectProviders } from '../config.js';
 import { initMemory, getMemoryPath } from '../memory.js';
 import { ensureSkillsDir, getProjectSkillsDir, listSkills } from '../skills.js';
+import { projectPolicyTemplate } from '../project-policy.js';
 
 // ── Constants ────────────────────────────────────────────────
 const MIN_NODE_MAJOR = 20;
@@ -151,6 +152,18 @@ function scaffoldSkillsDir(): ScaffoldResult {
   return { file: '.mythos/skills/', action: existed ? 'exists' : 'created' };
 }
 
+function scaffoldProjectPolicy(force: boolean): ScaffoldResult {
+  const target = resolve(process.cwd(), PROJECT_POLICY_FILE);
+
+  if (existsSync(target) && !force) {
+    return { file: PROJECT_POLICY_FILE, action: 'exists' };
+  }
+
+  mkdirSync(dirname(target), { recursive: true });
+  writeFileSync(target, projectPolicyTemplate(), 'utf-8');
+  return { file: PROJECT_POLICY_FILE, action: 'created' };
+}
+
 function inspectScaffoldState(): ScaffoldResult[] {
   return [
     {
@@ -164,6 +177,10 @@ function inspectScaffoldState(): ScaffoldResult[] {
     {
       file: '.mythos/skills/',
       action: existsSync(getProjectSkillsDir()) ? 'exists' : 'missing',
+    },
+    {
+      file: PROJECT_POLICY_FILE,
+      action: existsSync(resolve(process.cwd(), PROJECT_POLICY_FILE)) ? 'exists' : 'missing',
     },
   ];
 }
@@ -246,6 +263,7 @@ export async function initCommand(options: InitOptions): Promise<void> {
       scaffoldIgnoreFile(force),
       scaffoldMemory(force),
       scaffoldSkillsDir(),
+      scaffoldProjectPolicy(force),
     ];
 
   for (const r of results) {

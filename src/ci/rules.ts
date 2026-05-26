@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import type { ChangedFile, CIFinding, DiffInfo } from './types.js';
 import { readPackageJsonBeforeChange } from './git.js';
 import { scanChangedFilesForSecrets } from './secrets.js';
+import { PROJECT_POLICY_FILE } from '../config.js';
 
 const DANGEROUS_LIFECYCLE_SCRIPTS = new Set(['preinstall', 'install', 'postinstall']);
 const REVIEW_LIFECYCLE_SCRIPTS = new Set(['prepare', 'prepublish', 'prepublishOnly', 'publish', 'postpublish', 'postpack']);
@@ -37,6 +38,10 @@ function isDockerSurface(filePath: string): boolean {
 
 function isLockfile(filePath: string): boolean {
   return /^(?:package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb)$/i.test(filePath);
+}
+
+function isProjectPolicy(filePath: string): boolean {
+  return filePath.toLowerCase() === PROJECT_POLICY_FILE.toLowerCase();
 }
 
 function createFinding(partial: Omit<CIFinding, 'evidence'> & { evidence?: string[] }): CIFinding {
@@ -149,6 +154,19 @@ export function analyzePathRules(changedFiles: ChangedFile[]): CIFinding[] {
         evidence: [`${path} was ${file.status}`],
         why: 'Lockfiles control the exact dependency tree installed by package managers.',
         recommendation: 'Confirm the lockfile change matches the intended dependency update.',
+      }));
+      continue;
+    }
+
+    if (isProjectPolicy(path)) {
+      findings.push(createFinding({
+        id: 'mythos-policy-changed',
+        severity: 'warn',
+        title: 'Mythos project policy changed',
+        file: path,
+        evidence: [`${path} was ${file.status}`],
+        why: 'Project policy controls repo-local SWD blocks, confirmations, operation limits, and batch limits.',
+        recommendation: 'Review policy changes carefully before trusting external-agent or MCP writes in this repository.',
       }));
     }
   }

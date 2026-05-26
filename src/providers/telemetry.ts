@@ -211,12 +211,16 @@ export class TelemetryStore {
     try {
       this.db.exec(`
         DELETE FROM routing_decisions 
-        WHERE id < (SELECT MAX(id) - ${RETENTION_LIMIT} FROM routing_decisions);
+        WHERE id NOT IN (
+          SELECT id FROM routing_decisions ORDER BY id DESC LIMIT ${RETENTION_LIMIT}
+        );
       `);
 
       this.db.exec(`
         DELETE FROM failures 
-        WHERE id < (SELECT MAX(id) - ${RETENTION_LIMIT} FROM failures);
+        WHERE id NOT IN (
+          SELECT id FROM failures ORDER BY id DESC LIMIT ${RETENTION_LIMIT}
+        );
       `);
     } catch (e) {
       // Ignore

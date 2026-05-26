@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { applyExternalAgentActions } from './commands/swd.js';
+import { formatReceiptMarkdown } from './receipt-markdown.js';
 import {
   listReceipts,
   readReceipt,
@@ -201,6 +202,11 @@ export const MCP_TOOLS: MCPTool[] = [
           type: 'string',
           description: 'Receipt id, receipt JSON path, or latest. Defaults to latest.',
         },
+        format: {
+          type: 'string',
+          enum: ['json', 'markdown'],
+          description: 'Return raw receipt JSON or PR-ready Markdown. Defaults to json.',
+        },
       },
     },
     annotations: {
@@ -314,9 +320,26 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
 
   receipts_show: (args) => {
     const target = optionalString(args.target, 'target') ?? 'latest';
+    const format = optionalString(args.format, 'format') ?? 'json';
+    if (format !== 'json' && format !== 'markdown') {
+      throw new Error('format must be json or markdown.');
+    }
     const receipt = readReceipt(target);
     if (!receipt) {
       return toolError(`Receipt not found: ${target}`, { target });
+    }
+    if (format === 'markdown') {
+      const markdown = formatReceiptMarkdown(receipt);
+      return {
+        content: [{ type: 'text', text: markdown }],
+        structuredContent: {
+          ok: true,
+          receiptId: receipt.id,
+          format,
+          markdown,
+        },
+        isError: false,
+      };
     }
     return toolResult({ ok: true, receipt });
   },
@@ -454,7 +477,7 @@ function initializeResult(params: unknown): Record<string, unknown> {
       version: packageVersion(),
     },
     instructions:
-      'Mythos Router exposes model-free Strict Write Discipline tools. Use swd_dry_run before swd_apply when possible; sensitive paths remain blocked by default.',
+      'Mythos Router exposes model-free Strict Write Discipline tools. Use swd_dry_run before swd_apply when possible; sensitive paths and repo-local project policy rules remain enforced by default.',
   };
 }
 

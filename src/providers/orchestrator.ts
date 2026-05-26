@@ -22,6 +22,7 @@ interface ModelMetrics {
   costPer1k: number;     // Average cost per 1k tokens
   totalCalls: number;
   totalFailures: number;
+  consecutiveFailures: number;
   lastError: string | null;
   lastErrorTime: number;
 }
@@ -41,6 +42,7 @@ type OrchestratorTelemetry = Pick<TelemetryStore, 'updateMetrics' | 'logDecision
 // ── Retry Configuration ──────────────────────────────────────
 const RETRY_BACKOFFS_MS = [100, 500, 1000] as const;
 const CIRCUIT_BREAKER_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+const CIRCUIT_BREAKER_FAILURE_THRESHOLD = 2;
 const EMA_ALPHA = 0.3; // Smoothing factor for exponential moving average
 const DEFAULT_WATCHDOG_MS = 15_000;
 const WATCHDOG_LATENCY_MULTIPLIER = 3;
@@ -159,6 +161,7 @@ export class ProviderOrchestrator {
         costPer1k: 0,
         totalCalls: 0,
         totalFailures: 0,
+        consecutiveFailures: 0,
         lastError: null,
         lastErrorTime: 0,
       },
@@ -256,6 +259,7 @@ export class ProviderOrchestrator {
     m.avgLatency = m.avgLatency * (1 - EMA_ALPHA) + latencyMs * EMA_ALPHA;
     m.costPer1k = cost > 0 ? m.costPer1k * (1 - EMA_ALPHA) + cost * EMA_ALPHA : m.costPer1k;
     m.totalCalls++;
+    m.consecutiveFailures = 0;
     this.pushTelemetryState(slot);
   }
 
@@ -266,9 +270,19 @@ export class ProviderOrchestrator {
     m.successRate = m.successRate * (1 - EMA_ALPHA);
     m.totalCalls++;
     m.totalFailures++;
+    m.consecutiveFailures++;
     m.lastError = err.message;
     m.lastErrorTime = Date.now();
     this.pushTelemetryState(slot);
+  }
+
+  private maybeTripCircuitBreaker(slot: ProviderSlot, err: Error): void {
+    if (
+      isRetryableError(err) &&
+      slot.metrics.consecutiveFailures >= CIRCUIT_BREAKER_FAILURE_THRESHOLD
+    ) {
+      this.tripCircuitBreaker(slot);
+    }
   }
 
   private tripCircuitBreaker(slot: ProviderSlot): void {
@@ -297,7 +311,6 @@ export class ProviderOrchestrator {
 
   // ── Retry with Exponential Backoff ───────────────────────
   private async retryWithBackoff<T>(
-    slot: ProviderSlot,
     fn: () => Promise<T>,
     signal?: AbortSignal,
   ): Promise<T> {
@@ -329,9 +342,6 @@ export class ProviderOrchestrator {
         });
       }
     }
-
-    // Trip circuit breaker after exhausting retries
-    this.tripCircuitBreaker(slot);
     throw lastErr!;
   }
 
@@ -423,7 +433,6 @@ export class ProviderOrchestrator {
         };
 
         const response = await this.retryWithBackoff(
-          slot,
           () => slot.provider.streamMessage(messages, wrappedOptions),
           compositeSignal,
         );
@@ -472,6 +481,7 @@ export class ProviderOrchestrator {
 
         // Record failure and prepare for fallback
         this.recordFailure(slot, error);
+        this.maybeTripCircuitBreaker(slot, error);
         retryCount++;
         fallbackTriggered = true;
 
@@ -542,7 +552,6 @@ export class ProviderOrchestrator {
 
       try {
         const response = await this.retryWithBackoff(
-          slot,
           () => slot.provider.sendMessage(messages, options),
           options.signal,
         );
@@ -576,6 +585,7 @@ export class ProviderOrchestrator {
       } catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));
         this.recordFailure(slot, error);
+        this.maybeTripCircuitBreaker(slot, error);
         retryCount++;
         fallbackTriggered = true;
 

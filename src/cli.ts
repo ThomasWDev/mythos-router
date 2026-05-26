@@ -217,6 +217,10 @@ program
 program
   .command('mcp')
   .description('Run the Mythos MCP stdio server for SWD, receipts, and skills tools')
+  .argument('[action]', 'server | config', 'server')
+  .argument('[client]', 'generic | claude | cursor')
+  .option('--json', 'Print only the MCP config JSON when used with config')
+  .option('--command <name>', 'Command the MCP client should run', 'mythos')
   .action(mcpCommand);
 
 // ── mythos verify ────────────────────────────────────────────
@@ -279,6 +283,8 @@ program
   .argument('[target]', 'receipt id or latest')
   .option('-n, --limit <n>', 'Number of receipts to show when listing', '10')
   .option('--json', 'Print machine-readable JSON')
+  .option('--markdown', 'Print a PR-ready Markdown receipt summary for show/latest')
+  .option('--pr', 'Alias for --markdown')
   .action(receiptsCommand);
 
 // Mythos skill pack management

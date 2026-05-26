@@ -61,13 +61,14 @@ Zero slop. Zero hallucinated state. Full adaptive thinking.
 |  **Adaptive Thinking** | Opus 4.7 with configurable effort levels (high/medium/low) |
 |  **Strict Write Discipline** | Pre/post filesystem snapshots verify every model or external-agent file claim |
 |  **SWD Receipts** | Per-run trust receipts record touched files, hashes, provider/external-agent id, budget, git state, and verification result |
+|  **Project Policy** | `.mythos/policy.json` adds enforced repo-local SWD guardrails for sensitive project surfaces |
 |  **Self-Healing Memory** | Authority-based logging with a rebuildable SQLite FTS5 search index *(Node 22+)* |
 |  **Auto-Healing TDD** | Pass `--test-cmd` for bounded, error-driven autonomous repair loops |
 |  **Correction Turns** | Model gets 2 retries to match filesystem reality, then yields |
 |  **Integrity Gate** | `verify` command ensures referenced memory files still exist |
 |  **CI Verification** | `verify --ci` runs read-only PR checks for command-surface, sensitive-file, and receipt risks without an API key |
 |  **Bring Your Own Agent** | `mythos swd apply --stdin --json` lets any external agent route file actions through SWD without a Mythos model key |
-|  **MCP Adapter** | `mythos mcp` exposes SWD, receipt, and skill tools over stdio for MCP-compatible agent clients |
+|  **MCP Adapter** | `mythos mcp` exposes SWD, receipt, and skill tools over stdio; `mythos mcp config` prints client setup snippets |
 |  **Token Limiter** | Budget cap with graceful save — progress saved to MEMORY.md, never lose work |
 |  **Session Resume** | Pick up exactly where you left off after a crash or exit (`--resume`) |
 |  **Dry-Run Mode** | Preview every file operation before it executes — full transparency |
@@ -154,7 +155,7 @@ mythos init --check          # Check environment and project setup without writi
 mythos init --force          # Re-scaffold files even if they already exist
 ```
 
-`init` prepares the local repo surface Mythos uses: `.mythosignore`, `MEMORY.md`, and the project-local `.mythos/skills/` directory.
+`init` prepares the local repo surface Mythos uses: `.mythosignore`, `MEMORY.md`, `.mythos/policy.json`, and the project-local `.mythos/skills/` directory.
 
 ### `mythos learn` - Repo Skill Generation
 
@@ -315,30 +316,54 @@ Security defaults:
 - external JSON paths must be safe project-relative paths
 - `.env`, private keys, wallet files, `.git`, `.npmrc`, and secrets paths are blocked
 - deletes and command-surface files require `--allow-risky`
+- `.mythos/policy.json` can add repo-specific blocks, confirmations, operation limits, and batch limits
 - dry-runs do not write files or receipts
 - receipts record the external agent/model as `external:<agent-id>`
+
+### `.mythos/policy.json` - Project Safety Policy
+
+```json
+{
+  "version": 1,
+  "block": ["contracts/mainnet/**", "infra/prod/**"],
+  "confirm": ["src/payments/**", ".github/workflows/**"],
+  "limits": {
+    "allowDeletes": false,
+    "maxActions": 25,
+    "maxActionContentBytes": 120000,
+    "allowedOperations": ["CREATE", "MODIFY", "READ"]
+  }
+}
+```
+
+Project policy is an enforced SWD guardrail, not a prompt hint. It applies to `chat`, `run`, `swd apply`, and MCP `swd_apply`. Built-in sensitive path protection still wins, so policy files cannot allow `.env`, private keys, wallet files, `.git`, or `.npmrc`. `block` patterns fail closed, `confirm` patterns require human approval or explicit `--allow-risky` in external-agent flows, and malformed policy files block writes until fixed.
 
 ### `mythos mcp` — MCP Adapter for SWD
 
 ```bash
 mythos mcp
+mythos mcp config
+mythos mcp config claude
+mythos mcp config cursor
+mythos mcp config cursor --json
 ```
 
 `mcp` runs a local stdio Model Context Protocol server. It does not start an HTTP daemon, open a port, call a model provider, or duplicate the SWD engine. MCP clients launch it as a subprocess and call Mythos tools through JSON-RPC over stdin/stdout.
 
-Example MCP client entry:
+`mcp config` prints a paste-ready MCP server entry for clients such as Claude and Cursor:
 
 ```json
 {
   "mcpServers": {
     "mythos-router": {
       "command": "mythos",
-      "args": ["mcp"],
-      "cwd": "/path/to/your/repo"
+      "args": ["mcp"]
     }
   }
 }
 ```
+
+Run the client from the repository you want Mythos to guard, or use a project-scoped MCP config when your client supports it.
 
 Exposed tools:
 
@@ -347,23 +372,24 @@ Exposed tools:
 | `swd_dry_run` | Validates external-agent file actions without writing files or receipts |
 | `swd_apply` | Applies external-agent file actions through SWD, verifies disk state, rolls back failures, and writes receipts by default |
 | `receipts_list` | Lists recent local SWD receipts |
-| `receipts_show` | Reads a receipt by id, file path, or `latest` |
+| `receipts_show` | Reads a receipt by id, file path, or `latest`; pass `format: "markdown"` for PR-ready text |
 | `receipts_verify` | Re-checks current files and receipt integrity |
 | `skills_list` | Lists project-local and user-global skill packs |
 | `skills_check` | Validates all skills or one named skill/path |
 
-The mutating MCP tool is still guarded by the same external-agent SWD policy as `mythos swd apply`: safe project-relative paths, sensitive path blocking, explicit `allowRisky` for high-impact command surfaces and deletes, rollback on failed verification, and local receipts for successful non-dry-run applies.
+The mutating MCP tool is still guarded by the same external-agent SWD policy as `mythos swd apply`: safe project-relative paths, sensitive path blocking, repo-local `.mythos/policy.json` rules, explicit `allowRisky` for high-impact command surfaces and deletes, rollback on failed verification, and local receipts for successful non-dry-run applies.
 
 ### `mythos receipts` — SWD Trust Receipts
 
 ```bash
 mythos receipts              # List recent SWD receipts
 mythos receipts show latest  # Inspect the newest receipt
+mythos receipts show latest --markdown  # PR-ready Markdown summary
 mythos receipts verify latest  # Re-check current files against receipt hashes
 mythos receipts --json       # Machine-readable output for tooling
 ```
 
-Every non-dry-run SWD file operation writes a local receipt to `.mythos/receipts/`. Receipts include the request summary, provider or external-agent/model identity, git branch/commit, per-file before/after hashes, rollback status, and verification errors. Built-in `chat`/`run` receipts also include token usage, budget snapshot, active skill packs, and optional `--test-cmd` result. `verify` turns those receipts into a quick drift check for "did the files still match what SWD verified?" Receipts are local by default and gitignored by default. They may include prompts, file paths, provider metadata, skill names, test command names, and a short test output tail. Do not publish raw receipts from private repositories; force-add only when you intentionally want a shared audit trail.
+Every non-dry-run SWD file operation writes a local receipt to `.mythos/receipts/`. Receipts include the request summary, provider or external-agent/model identity, git branch/commit, per-file before/after hashes, rollback status, and verification errors. Built-in `chat`/`run` receipts also include token usage, budget snapshot, active skill packs, and optional `--test-cmd` result. `verify` turns those receipts into a quick drift check for "did the files still match what SWD verified?" `--markdown` (or `--pr`) prints a compact paste-ready receipt summary for PR reviews, especially useful when a write failed or rolled back. Receipts are local by default and gitignored by default. They may include prompts, file paths, provider metadata, skill names, test command names, and a short test output tail. Do not publish raw receipts from private repositories; force-add only when you intentionally want a shared audit trail.
 
 ### `mythos verify` — Local Memory Scan + CI Verification
 
@@ -379,7 +405,7 @@ Local mode scans your project and cross-references against `MEMORY.md`:
 - ✅ **Verified** — Memory logs are present and up to date
 - ❌ **Missing** — Memory references a file that doesn't exist
 
-CI mode does not call a model and does not require an API key. It reviews the current PR/diff for high-impact repo changes such as package scripts, npm lifecycle hooks, GitHub Actions workflows, shell/deploy surfaces, `.env`/`.npmrc`, high-confidence secrets, and changed Mythos receipts.
+CI mode does not call a model and does not require an API key. It reviews the current PR/diff for high-impact repo changes such as package scripts, npm lifecycle hooks, GitHub Actions workflows, shell/deploy surfaces, `.env`/`.npmrc`, `.mythos/policy.json`, high-confidence secrets, and changed Mythos receipts.
 
 GitHub Actions example:
 
@@ -482,6 +508,8 @@ mythos-router/
 │   ├── diff.ts          # Myers' diff algorithm (zero-dependency)
 │   ├── git.ts           # Git operations (branching, committing)
 │   ├── mcp.ts           # MCP stdio adapter for SWD, receipts, and skills tools
+│   ├── mcp-config.ts    # Paste-ready MCP client config snippets
+│   ├── project-policy.ts # Repo-local SWD policy loading and matching
 │   ├── utils.ts         # Terminal formatting, badges, prompts (zero-dep ANSI)
 │   ├── index.ts         # Public SDK exports
 │   └── commands/
@@ -557,6 +585,7 @@ If you prefer to keep it private, add `MEMORY.md` to your `.gitignore`.
 | File | Purpose |
 |------|---------| 
 | `.mythosignore` | Patterns to exclude from SWD scanning |
+| `.mythos/policy.json` | Enforced repo-local SWD safety policy |
 | `.mythos/skills/` | Optional project-local skill packs that can be committed with a repo |
 | `.mythos/receipts/` | Local SWD receipts, gitignored by default because they may include prompts and file paths |
 | `MEMORY.md` | Auto-generated agentic memory log |

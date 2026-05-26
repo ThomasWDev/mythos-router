@@ -1,4 +1,10 @@
 import type { FileAction } from './swd.js';
+import {
+  evaluateProjectPolicyAction,
+  evaluateProjectPolicyBatch,
+  loadProjectPolicy,
+  type ProjectPolicyState,
+} from './project-policy.js';
 
 export type ActionRisk = 'safe' | 'confirm' | 'block';
 
@@ -53,14 +59,19 @@ export function normalizeActionPath(filePath: string): string {
   return filePath.replace(/\\/g, '/').replace(/^\.\//, '');
 }
 
-export function classifyActionRisk(action: FileAction): ActionRiskVerdict {
+export function classifyActionRisk(action: FileAction, policyState: ProjectPolicyState = loadProjectPolicy()): ActionRiskVerdict {
   const normalizedPath = normalizeActionPath(action.path);
+  const projectDecision = evaluateProjectPolicyAction(action, policyState);
 
   if (BLOCKED_PATTERNS.some((pattern) => pattern.test(normalizedPath))) {
     return {
       risk: 'block',
       reason: `Sensitive file is blocked by default: ${action.path}`,
     };
+  }
+
+  if (projectDecision?.risk === 'block') {
+    return projectDecision;
   }
 
   if (action.operation === 'DELETE') {
@@ -77,6 +88,10 @@ export function classifyActionRisk(action: FileAction): ActionRiskVerdict {
     };
   }
 
+  if (projectDecision?.risk === 'confirm') {
+    return projectDecision;
+  }
+
   return {
     risk: 'safe',
     reason: `Safe project file: ${action.path}`,
@@ -87,9 +102,27 @@ export function reviewActions(actions: FileAction[]): PolicyReview {
   const approved: FileAction[] = [];
   const blocked: PolicyReview['blocked'] = [];
   const needsConfirmation: PolicyReview['needsConfirmation'] = [];
+  const policyState = loadProjectPolicy();
+  const batchDecision = evaluateProjectPolicyBatch(actions, policyState);
+
+  if (batchDecision) {
+    if (batchDecision.risk === 'block') {
+      return {
+        approved,
+        blocked: actions.map((action) => ({ action, verdict: batchDecision })),
+        needsConfirmation,
+      };
+    }
+
+    return {
+      approved,
+      blocked,
+      needsConfirmation: actions.map((action) => ({ action, verdict: batchDecision })),
+    };
+  }
 
   for (const action of actions) {
-    const verdict = classifyActionRisk(action);
+    const verdict = classifyActionRisk(action, policyState);
     if (verdict.risk === 'block') {
       blocked.push({ action, verdict });
     } else if (verdict.risk === 'confirm') {

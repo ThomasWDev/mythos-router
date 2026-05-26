@@ -16,6 +16,7 @@ export const MEMORY_DB_FILE = 'memory.db';
 export const MEMORY_MAX_LINES = 100;
 
 export const MYTHOSIGNORE_FILE = '.mythosignore';
+export const PROJECT_POLICY_FILE = '.mythos/policy.json';
 
 // ── Budget Defaults (Financial Safety) ───────────────────────
 export const DEFAULT_MAX_TOKENS_PER_SESSION = 500_000;

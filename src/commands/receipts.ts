@@ -6,11 +6,14 @@ import {
   type ReceiptSummary,
   type SWDReceipt,
 } from '../receipts.js';
+import { formatReceiptMarkdown } from '../receipt-markdown.js';
 import { c, error, heading, hr, info, success, theme, warn } from '../utils.js';
 
 interface ReceiptsOptions {
   limit?: string;
   json?: boolean;
+  markdown?: boolean;
+  pr?: boolean;
 }
 
 export async function receiptsCommand(
@@ -26,12 +29,12 @@ export async function receiptsCommand(
   }
 
   if (normalizedAction === 'latest') {
-    printReceipt('latest', options.json);
+    printReceipt('latest', options);
     return;
   }
 
   if (normalizedAction === 'show') {
-    printReceipt(target ?? 'latest', options.json);
+    printReceipt(target ?? 'latest', options);
     return;
   }
 
@@ -41,7 +44,7 @@ export async function receiptsCommand(
   }
 
   warn(`Unknown receipts action: ${normalizedAction}`);
-  info('Usage: mythos receipts | mythos receipts show latest | mythos receipts verify latest');
+  info('Usage: mythos receipts | mythos receipts show latest [--markdown] | mythos receipts verify latest');
 }
 
 function printReceiptList(limit: number, asJson?: boolean): void {
@@ -73,15 +76,20 @@ function printReceiptList(limit: number, asJson?: boolean): void {
   }
 }
 
-function printReceipt(target: string, asJson?: boolean): void {
+function printReceipt(target: string, options: ReceiptsOptions = {}): void {
   const receipt = readReceipt(target);
   if (!receipt) {
     error(`Receipt not found: ${target}`);
     return;
   }
 
-  if (asJson) {
+  if (options.json) {
     console.log(JSON.stringify(receipt, null, 2));
+    return;
+  }
+
+  if (options.markdown || options.pr) {
+    console.log(formatReceiptMarkdown(receipt));
     return;
   }
 

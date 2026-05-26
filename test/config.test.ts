@@ -14,6 +14,7 @@ import {
   MEMORY_FILE,
   MEMORY_DB_FILE,
   MEMORY_MAX_LINES,
+  PROJECT_POLICY_FILE,
   validateProviderKeys,
 } from '../src/config.js';
 
@@ -91,6 +92,10 @@ describe('Config Constants', () => {
     assert.equal(MEMORY_FILE, 'MEMORY.md');
     assert.equal(MEMORY_DB_FILE, 'memory.db');
     assert.ok(MEMORY_MAX_LINES > 0);
+  });
+
+  it('project policy path is set', () => {
+    assert.equal(PROJECT_POLICY_FILE, '.mythos/policy.json');
   });
 });
 

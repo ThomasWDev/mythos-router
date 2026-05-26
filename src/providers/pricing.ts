@@ -61,7 +61,7 @@ export function calculateCost(
 
 /**
  * Get the per-token costs for a specific model.
- * Returns null if model is not in the registry.
+ * Falls back to conservative estimates when the model is not in the registry.
  */
 export function getModelPricing(modelId: string): { inputPerToken: number; outputPerToken: number } {
   const pricing = PRICING_TABLE[modelId] ?? FALLBACK_PRICING;

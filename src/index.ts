@@ -84,6 +84,21 @@ export {
   type LearnRepoSkillResult,
 } from './learn.js';
 
+export {
+  PROJECT_POLICY_VERSION,
+  DEFAULT_PROJECT_POLICY,
+  getProjectPolicyPath,
+  loadProjectPolicy,
+  projectPolicyTemplate,
+  evaluateProjectPolicyAction,
+  evaluateProjectPolicyBatch,
+  type ProjectPolicy,
+  type ProjectPolicyLimits,
+  type ProjectPolicyState,
+  type ProjectPolicyDecision,
+  type ProjectPolicyOperation,
+} from './project-policy.js';
+
 // Export SWD Receipts
 export {
   createSWDReceipt,
@@ -107,6 +122,7 @@ export {
   type ReceiptVerification,
   type ReceiptFileVerification,
 } from './receipts.js';
+export { formatReceiptMarkdown } from './receipt-markdown.js';
 
 // Export the Budget Limiter
 export { SessionBudget, type BudgetConfig, type BudgetCheck, type BudgetSnapshot } from './budget.js';
@@ -129,3 +145,12 @@ export {
   type JsonRpcSuccessResponse,
   type JsonRpcErrorResponse,
 } from './mcp.js';
+export {
+  MCP_CONFIG_CLIENTS,
+  createMCPServerConfig,
+  isMCPConfigClient,
+  normalizeMCPConfigClient,
+  renderMCPConfig,
+  type MCPConfigClient,
+  type MCPServerConfig,
+} from './mcp-config.js';

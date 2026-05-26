@@ -4,6 +4,8 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { handleMCPMessage } from '../src/mcp.js';
+import { createMCPServerConfig, renderMCPConfig } from '../src/mcp-config.js';
+import { createSWDReceipt, saveSWDReceipt } from '../src/receipts.js';
 
 async function withTempProject<T>(prefix: string, fn: (dir: string) => Promise<T> | T): Promise<T> {
   const original = process.cwd();
@@ -18,6 +20,17 @@ async function withTempProject<T>(prefix: string, fn: (dir: string) => Promise<T
 }
 
 describe('MCP adapter', () => {
+  it('renders paste-ready MCP client config', () => {
+    const config = createMCPServerConfig();
+    assert.equal(config.mcpServers['mythos-router'].command, 'mythos');
+    assert.deepEqual(config.mcpServers['mythos-router'].args, ['mcp']);
+
+    const rendered = renderMCPConfig('cursor');
+    assert.match(rendered, /Mythos MCP config \(Cursor\)/);
+    assert.match(rendered, /"mythos-router"/);
+    assert.match(rendered, /"args": \[\s+"mcp"\s+\]/);
+  });
+
   it('initializes with tool capability metadata', async () => {
     const response = await handleMCPMessage({
       jsonrpc: '2.0',
@@ -51,6 +64,7 @@ describe('MCP adapter', () => {
     assert.ok(names.includes('swd_dry_run'));
     assert.ok(names.includes('swd_apply'));
     assert.ok(names.includes('receipts_list'));
+    assert.ok(names.includes('receipts_show'));
     assert.ok(names.includes('receipts_verify'));
     assert.ok(names.includes('skills_list'));
     assert.equal(tools.find((tool) => tool.name === 'swd_dry_run')?.annotations?.readOnlyHint, true);
@@ -117,6 +131,61 @@ describe('MCP adapter', () => {
       assert.equal(structured.ok, false);
       assert.equal(structured.rejected[0]?.risk, 'block');
       assert.equal(existsSync('.env'), false);
+    });
+  });
+
+  it('returns PR-ready receipt markdown through receipts_show', async () => {
+    await withTempProject('mythos-mcp-receipt-md-', async () => {
+      const receipt = createSWDReceipt({
+        request: 'external agent failed write',
+        summary: 'MODIFY: failed.txt',
+        provider: {
+          providerId: 'external:mcp-agent',
+          modelId: 'manual',
+        },
+        result: {
+          success: false,
+          rolledBack: true,
+          rollbackErrors: [],
+          errors: ['Hash mismatch after write'],
+          results: [
+            {
+              action: {
+                path: 'failed.txt',
+                operation: 'MODIFY',
+                intent: 'MUTATE',
+                description: 'Update failed file',
+              },
+              status: 'drift',
+              detail: 'Hash mismatch after MODIFY failed.txt',
+            },
+          ],
+        },
+      });
+      saveSWDReceipt(receipt);
+
+      const response = await handleMCPMessage({
+        jsonrpc: '2.0',
+        id: 4,
+        method: 'tools/call',
+        params: {
+          name: 'receipts_show',
+          arguments: {
+            target: receipt.id,
+            format: 'markdown',
+          },
+        },
+      });
+
+      assert.ok(response && 'result' in response);
+      assert.equal(response.result.isError, false);
+      const structured = response.result.structuredContent as { ok: boolean; markdown: string };
+      assert.equal(structured.ok, true);
+      assert.match(structured.markdown, /### Mythos SWD Receipt/);
+      assert.match(structured.markdown, /\| Status \| failed \(rolled back\) \|/);
+      assert.match(structured.markdown, /Hash mismatch after write/);
+      const content = response.result.content as Array<{ type: string; text: string }>;
+      assert.match(content[0]!.text, new RegExp(`mythos receipts verify ${receipt.id}`));
     });
   });
 });

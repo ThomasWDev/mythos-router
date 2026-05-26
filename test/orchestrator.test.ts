@@ -102,6 +102,34 @@ describe('ProviderOrchestrator', () => {
     assert.equal(fallback.sendCalls, 1);
   });
 
+  it('does not degrade a provider after one exhausted retryable request', async () => {
+    const states: Array<{ id: string; degradedUntil: number }> = [];
+    const telemetry = {
+      updateMetrics: (state: { id: string; degradedUntil: number }) => {
+        states.push({ id: state.id, degradedUntil: state.degradedUntil });
+      },
+      logDecision: () => {},
+      logFailure: () => {},
+    };
+    const orchestrator = new ProviderOrchestrator(telemetry);
+    const failing = new FakeProvider('failing', ['streaming'], {
+      send: async () => {
+        throw new Error('503 service unavailable');
+      },
+    });
+    const fallback = new FakeProvider('fallback');
+
+    orchestrator.registerProvider(failing, { priority: 0 });
+    orchestrator.registerProvider(fallback, { priority: 1 });
+
+    const response = await orchestrator.sendMessage(messages, sendOptions);
+    const failingStates = states.filter((state) => state.id === 'failing');
+
+    assert.equal(response.metadata.providerId, 'fallback');
+    assert.equal(failing.sendCalls, 4);
+    assert.equal(failingStates.some((state) => state.degradedUntil > 0), false);
+  });
+
   it('does not call fallback providers when fallback is disabled', async () => {
     const orchestrator = new ProviderOrchestrator(noopTelemetry);
     const failing = new FakeProvider('failing', ['streaming'], {

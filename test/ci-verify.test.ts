@@ -91,6 +91,24 @@ describe('mythos verify --ci', () => {
     }
   });
 
+  it('warns when Mythos project policy changes', () => {
+    const dir = makeRepo();
+    try {
+      mkdirSync(join(dir, '.mythos'), { recursive: true });
+      writeFileSync(join(dir, '.mythos', 'policy.json'), JSON.stringify({
+        version: 1,
+        block: ['infra/prod/**'],
+      }, null, 2));
+
+      const report = runCIVerification({ cwd: dir });
+      assert.equal(report.summary.warn, 1);
+      assert.equal(report.summary.exitCode, 0);
+      assert.ok(report.findings.some((finding) => finding.id === 'mythos-policy-changed'));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('uses Mythos receipt verification when a receipt is changed in the diff', () => {
     const repoRoot = process.cwd();
     const dir = makeRepo();
