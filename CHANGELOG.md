@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.15.0] - 2026-05-29
+
+### Added
+- **Isolated Runs** - `mythos swd apply --check <cmd...>` and `--run-checks` test a batch in a throwaway copy of the project, run the checks there, and apply the same approved actions to the real working tree only if every check passes. Available over MCP `swd_apply` via `check[]` / `runChecks`.
+- **Policy-Declared Checks** - `.mythos/policy.json` now supports a validated, capped `checks` array of `{ name, command }` gates. Declaring checks never executes them; they run only with an explicit `--run-checks` opt-in.
+- **Sandbox Result in JSON** - `swd apply --json` output now includes a `sandbox` summary (per-check pass/fail and redacted output tail) for CI and automation.
+- **Receipt Markdown Format Alias** - `mythos receipts show <id|latest> --format markdown` now matches MCP `receipts_show` format naming, while preserving the existing `--markdown` and `--pr` flags.
+
+### Security
+- **Fail-Closed Gating** - When isolated-run checks fail, the real working tree is never modified. The sandbox uses a 0700 temp dir, jails every write to the sandbox root (realpath + traversal rejection so a copied symlink cannot escape), excludes `.git`, caps mirrored file count, times out checks, and is always cleaned up.
+- **No Implicit Execution** - A cloned untrusted repository's `policy.json` cannot trigger command execution on its own; checks run only on explicit operator opt-in, and never during `--dry-run`. Check output is secret-redacted before display or receipts.
+
+### Fixed
+- **Dry-Run Receipt Suppression** - CLI `mythos swd apply --dry-run` no longer writes SWD receipts by default, keeping preview mode side-effect-free.
+
+---
+
 ## [1.14.0] - 2026-05-26
 
 ### Added
@@ -398,6 +415,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Correction Turns** — max 2 retries before yielding to human.
 - **Dream/Verify Commands** — memory compression and drift detection.
 
+[1.15.0]: https://github.com/thewaltero/mythos-router/releases/tag/v1.15.0
 [1.14.0]: https://github.com/thewaltero/mythos-router/releases/tag/v1.14.0
 [1.13.0]: https://github.com/thewaltero/mythos-router/releases/tag/v1.13.0
 [1.12.0]: https://github.com/thewaltero/mythos-router/releases/tag/v1.12.0
