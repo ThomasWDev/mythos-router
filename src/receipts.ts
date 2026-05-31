@@ -442,16 +442,37 @@ function readReceiptFile(filePath: string): SWDReceipt | null {
   }
 }
 
+function isWithinReceiptsDir(dir: string, candidate: string): boolean {
+  const realDir = realPathForComparison(dir);
+  const realCandidate = realPathForComparison(candidate);
+  const rel = path.relative(realDir, realCandidate);
+  // Must resolve to a real file *inside* the receipts dir: non-empty, not a
+  // parent-escape, and not an absolute path (which would mean a different root).
+  return rel.length > 0 && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
 function receiptPathFor(target: string): string | null {
   const files = receiptFiles();
   if (target === 'latest') return files[0] ?? null;
 
+  const dir = getReceiptsDir();
   const id = target.endsWith('.json') ? target.slice(0, -5) : target;
-  const direct = path.join(getReceiptsDir(), `${id}.json`);
-  if (existsSync(direct)) return direct;
 
+  // Build candidates, then require each to resolve *inside* the receipts dir.
+  // This blocks both `..` traversal smuggled into an id and arbitrary absolute
+  // paths pointing elsewhere on disk (receipts are local artifacts by design).
+  const candidates: string[] = [path.resolve(dir, `${toNativePath(id)}.json`)];
   const nativeTarget = toNativePath(target);
-  if (path.isAbsolute(nativeTarget) && existsSync(nativeTarget)) return nativeTarget;
+  if (path.isAbsolute(nativeTarget)) {
+    candidates.unshift(path.normalize(nativeTarget));
+  }
+
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    if (!isWithinReceiptsDir(dir, candidate)) continue;
+    return candidate;
+  }
+
   return null;
 }
 

@@ -61,6 +61,7 @@ describe('MCP adapter', () => {
     const tools = response.result.tools as Array<{ name: string; annotations?: Record<string, unknown> }>;
     const names = tools.map((tool) => tool.name);
 
+    assert.ok(names.includes('swd_validate'));
     assert.ok(names.includes('swd_dry_run'));
     assert.ok(names.includes('swd_apply'));
     assert.ok(names.includes('receipts_list'));
@@ -68,7 +69,42 @@ describe('MCP adapter', () => {
     assert.ok(names.includes('receipts_verify'));
     assert.ok(names.includes('skills_list'));
     assert.equal(tools.find((tool) => tool.name === 'swd_dry_run')?.annotations?.readOnlyHint, true);
+    assert.equal(tools.find((tool) => tool.name === 'swd_validate')?.annotations?.readOnlyHint, true);
     assert.equal(tools.find((tool) => tool.name === 'swd_apply')?.annotations?.destructiveHint, true);
+  });
+
+  it('validates external actions through MCP without writing files', async () => {
+    await withTempProject('mythos-mcp-validate-', async () => {
+      const response = await handleMCPMessage({
+        jsonrpc: '2.0',
+        id: 20,
+        method: 'tools/call',
+        params: {
+          name: 'swd_validate',
+          arguments: {
+            contract: {
+              allowedPaths: ['src/**'],
+              expectedOutputs: ['src/mcp-validated.ts'],
+            },
+            actions: [
+              {
+                path: 'src/mcp-validated.ts',
+                operation: 'CREATE',
+                description: 'Validate MCP action',
+                content: 'export const ok = true;\n',
+              },
+            ],
+          },
+        },
+      });
+
+      assert.ok(response && 'result' in response);
+      assert.equal(response.result.isError, false);
+      const structured = response.result.structuredContent as { ok: boolean; contract?: { ok: boolean } };
+      assert.equal(structured.ok, true);
+      assert.equal(structured.contract?.ok, true);
+      assert.equal(existsSync(join('src', 'mcp-validated.ts')), false);
+    });
   });
 
   it('dry-runs external actions without writing files', async () => {

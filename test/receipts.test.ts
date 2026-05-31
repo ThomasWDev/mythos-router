@@ -120,6 +120,25 @@ describe('SWD receipts', () => {
     assert.equal(receipt.skills?.[1]?.path, undefined);
   });
 
+  it('refuses to read receipts from outside the receipts directory', () => {
+    const receipt = createSWDReceipt({
+      request: 'jail check',
+      summary: 'jail check',
+      result: { success: true, results: [], rolledBack: false, rollbackErrors: [], errors: [] },
+    });
+    saveSWDReceipt(receipt);
+
+    // A JSON file outside .mythos/receipts must not be readable by path.
+    const outside = join(tempDir, 'outside.json');
+    writeFileSync(outside, JSON.stringify({ id: 'evil', secret: 'do-not-read' }), 'utf-8');
+
+    assert.equal(readReceipt(outside), null, 'absolute path outside receipts dir must be rejected');
+    assert.equal(readReceipt('../../outside'), null, 'parent-traversal id must be rejected');
+
+    // The legitimate id still resolves inside the jail.
+    assert.equal(readReceipt(receipt.id)?.id, receipt.id);
+  });
+
   it('normalizes receipt paths even when cwd is a symlinked project root', (t) => {
     const filePath = 'linked-root.txt';
     const absPath = join(tempDir, filePath);

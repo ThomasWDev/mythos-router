@@ -25,10 +25,24 @@ Expected behavior:
 - does not create files
 - does not write receipts
 
+## Validate The Contract
+
+```bash
+mythos swd validate --file valid-contract.json --json
+mythos swd validate --file invalid-traversal.json --json
+```
+
+Expected behavior:
+
+- `valid-contract.json` passes schema and task-contract validation
+- `invalid-traversal.json` fails before any write path is reached
+- validation does not create files, receipts, or run records
+
 ## Apply And Inspect Receipt
 
 ```bash
 mythos swd apply --file actions.json --json
+mythos runs show latest --json
 mythos receipts show latest --markdown
 mythos receipts verify latest --json
 ```
@@ -38,6 +52,9 @@ mythos receipts verify latest --json
 ```bash
 mythos swd apply --file actions.json --json --check "npm test"
 ```
+
+`--check` is a trusted shell command. Use it for commands you would run
+yourself, not for command strings supplied by an untrusted agent or user.
 
 Expected behavior:
 
@@ -51,6 +68,7 @@ Expected behavior:
 - creates `agent-output.md`
 - verifies the actual filesystem state
 - writes a local SWD receipt under `.mythos/receipts/`
+- writes a local run outcome under `.mythos/runs/`
 - lets you paste the Markdown receipt into a PR or review thread
 
 ## Blocked Sensitive Path

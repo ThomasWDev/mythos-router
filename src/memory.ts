@@ -290,6 +290,21 @@ export function searchMemory(query: string, options?: { createIfMissing?: boolea
 }
 
 /**
+ * Classifies a MEMORY.md line as a real data row (not the column header or the
+ * markdown separator). The previous heuristic dropped any row that merely
+ * *contained* "---" or "Timestamp", which silently lost legitimate entries
+ * whose action/result mentioned those substrings (e.g. diffs, rules).
+ */
+function isMemoryEntryRow(line: string): boolean {
+  if (!line.startsWith('|')) return false;
+  // Markdown separator row: only pipes, dashes, colons, and whitespace.
+  if (/^[\s|:-]+$/.test(line)) return false;
+  // Column header row.
+  if (line.includes('Timestamp') && line.includes('Verified Result')) return false;
+  return true;
+}
+
+/**
  * Lower-level helper to parse MEMORY.md content directly.
  * Used by rebuildIndex to avoid infinite recursion with initMemory.
  */
@@ -301,7 +316,7 @@ function parseMemoryFile(): MemoryEntry[] {
 
   const entries: MemoryEntry[] = [];
   for (const line of lines) {
-    if (line.startsWith('|') && !line.includes('---') && !line.includes('Timestamp')) {
+    if (isMemoryEntryRow(line)) {
       const cols = line.split('|').map((s) => s.trim()).filter(Boolean);
       if (cols.length >= 3) {
         entries.push({
@@ -373,7 +388,7 @@ export function readMemory(): { header: string; entries: MemoryEntry[]; raw: str
   const headerLines: string[] = [];
 
   for (const line of lines) {
-    if (line.startsWith('|') && !line.includes('---') && !line.includes('Timestamp')) {
+    if (isMemoryEntryRow(line)) {
       break;
     }
     headerLines.push(line);

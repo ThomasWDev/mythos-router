@@ -31,6 +31,11 @@ export function saveSessionMetric(metric: SessionMetric): void {
     const content = fs.readFileSync(METRICS_FILE, 'utf-8');
     const metrics: SessionMetric[] = JSON.parse(content);
     metrics.push(metric);
+    // Keep the file bounded; retain the most recent entries.
+    const MAX_METRICS = 5000;
+    if (metrics.length > MAX_METRICS) {
+      metrics.splice(0, metrics.length - MAX_METRICS);
+    }
     fs.writeFileSync(METRICS_FILE, JSON.stringify(metrics, null, 2), 'utf-8');
   } catch (err) {
     // Fail silently so we don't disrupt the user workflow

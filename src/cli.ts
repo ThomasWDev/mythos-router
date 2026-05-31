@@ -30,6 +30,8 @@ import { skillsCommand } from './commands/skills.js';
 import { learnCommand } from './commands/learn.js';
 import { swdCommand } from './commands/swd.js';
 import { mcpCommand } from './commands/mcp.js';
+import { runsCommand } from './commands/runs.js';
+import { policyCommand } from './commands/policy.js';
 import {
   DEFAULT_MAX_TOKENS_PER_SESSION,
   DEFAULT_MAX_TURNS,
@@ -112,6 +114,10 @@ program
     '3',
   )
   .option(
+    '--test-timeout <ms>',
+    'Timeout in milliseconds for each --test-cmd run (default: 120000)',
+  )
+  .option(
     '-s, --skill <names...>',
     'Load verified skill packs (e.g., -s repo -s security-review)',
   )
@@ -182,6 +188,10 @@ program
     '3',
   )
   .option(
+    '--test-timeout <ms>',
+    'Timeout in milliseconds for each --test-cmd run (default: 120000)',
+  )
+  .option(
     '-s, --skill <names...>',
     'Load verified skill packs (e.g., -s repo -s security-review)',
   )
@@ -198,8 +208,8 @@ program
 // ── mythos swd ───────────────────────────────────────────────
 program
   .command('swd')
-  .description('Apply external-agent file actions through model-free Strict Write Discipline')
-  .argument('[action]', 'apply', 'apply')
+  .description('Apply or validate external-agent file actions through model-free Strict Write Discipline')
+  .argument('[action]', 'apply | validate', 'apply')
   .option('--stdin', 'Read external-agent FILE_ACTION or JSON input from stdin')
   .option('--file <path>', 'Read external-agent FILE_ACTION or JSON input from a file')
   .option('--json', 'Print machine-readable JSON output')
@@ -207,13 +217,32 @@ program
   .option('--no-rollback', 'Disable rollback on failed verification')
   .option('--no-receipt', 'Do not save a SWD receipt')
   .option('--allow-risky', 'Allow high-impact actions that normally require human confirmation; sensitive files remain blocked')
-  .option('--check <cmd...>', 'Run command(s) in an isolated copy before applying; apply only if all pass (repeatable)')
-  .option('--run-checks', 'Run the checks declared in .mythos/policy.json in an isolated copy before applying')
+  .option('--check <cmd...>', 'Run trusted shell command(s) in an isolated copy before applying; apply only if all pass (repeatable)')
+  .option('--run-checks', 'Run trusted checks declared in .mythos/policy.json in an isolated copy before applying')
+  .option('--no-run-log', 'Do not write a local run history record for this apply')
   .option('--request <text>', 'Receipt request label for external-agent runs')
   .option('--summary <text>', 'Receipt summary override')
   .option('--agent <id>', 'External agent identifier for receipts')
   .option('--model <id>', 'External agent model identifier for receipts')
   .action(swdCommand);
+
+// Local external-agent run history
+program
+  .command('runs')
+  .description('List and inspect local external-agent SWD run outcomes')
+  .argument('[action]', 'list | show | latest')
+  .argument('[target]', 'run id or latest')
+  .option('-n, --limit <n>', 'Number of runs to show when listing', '10')
+  .option('--json', 'Print machine-readable JSON')
+  .action(runsCommand);
+
+// Project policy suggestions
+program
+  .command('policy')
+  .description('Inspect the repository and suggest SWD policy guardrails without writing files')
+  .argument('[action]', 'suggest', 'suggest')
+  .option('--json', 'Print machine-readable JSON')
+  .action(policyCommand);
 
 // MCP stdio adapter for external agent tools
 program

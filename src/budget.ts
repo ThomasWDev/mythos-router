@@ -10,6 +10,7 @@ import {
   COST_PER_INPUT_TOKEN,
   COST_PER_OUTPUT_TOKEN,
 } from './config.js';
+import { calculateCost } from './providers/pricing.js';
 import { c, progressBar, theme } from './utils.js';
 
 // ── Types ────────────────────────────────────────────────────
@@ -80,6 +81,12 @@ export class SessionBudget {
   private turnCount = 0;
   private startedAt: number;
   private enabled: boolean;
+  // Accurate per-call cost. Populated only when record() is given a model id,
+  // so BYOK providers (OpenAI/DeepSeek) are billed at their real rates instead
+  // of the Anthropic fixed-rate fallback. When no model id is ever supplied
+  // (e.g. raw SDK usage), status() falls back to the fixed-rate estimate.
+  private accumulatedModelCost = 0;
+  private hasModelCost = false;
 
   constructor(config?: Partial<BudgetConfig>, enabled = true) {
     this.config = {
@@ -94,9 +101,15 @@ export class SessionBudget {
   }
 
   // ── Record token usage after an API call ─────────────────
-  record(inputTokens: number, outputTokens: number): void {
-    this.totalInput += nonNegativeIntegerOrZero(inputTokens);
-    this.totalOutput += nonNegativeIntegerOrZero(outputTokens);
+  record(inputTokens: number, outputTokens: number, modelId?: string): void {
+    const input = nonNegativeIntegerOrZero(inputTokens);
+    const output = nonNegativeIntegerOrZero(outputTokens);
+    this.totalInput += input;
+    this.totalOutput += output;
+    if (modelId) {
+      this.accumulatedModelCost += calculateCost(modelId, input, output);
+      this.hasModelCost = true;
+    }
     this.turnCount++;
   }
 
@@ -105,6 +118,13 @@ export class SessionBudget {
     this.totalInput = nonNegativeIntegerOrZero(inputTokens);
     this.totalOutput = nonNegativeIntegerOrZero(outputTokens);
     this.turnCount = nonNegativeIntegerOrZero(turns);
+    // Seed the accurate-cost accumulator with a fixed-rate estimate of the
+    // restored tokens so cost stays continuous if the resumed session then
+    // records model-tagged turns. hasModelCost stays false until a real
+    // model-tagged call arrives, preserving fixed-rate behavior otherwise.
+    this.accumulatedModelCost =
+      this.totalInput * this.config.costPerInputToken +
+      this.totalOutput * this.config.costPerOutputToken;
   }
 
   // ── Check if budget is still ok ──────────────────────────
@@ -154,9 +174,10 @@ export class SessionBudget {
 
   // ── Get current snapshot ─────────────────────────────────
   status(): BudgetSnapshot {
-    const estimatedCostUSD =
-      this.totalInput * this.config.costPerInputToken +
-      this.totalOutput * this.config.costPerOutputToken;
+    const estimatedCostUSD = this.hasModelCost
+      ? this.accumulatedModelCost
+      : this.totalInput * this.config.costPerInputToken +
+        this.totalOutput * this.config.costPerOutputToken;
     return {
       totalTokens: this.totalInput + this.totalOutput,
       inputTokens: this.totalInput,

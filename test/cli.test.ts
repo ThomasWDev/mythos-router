@@ -31,6 +31,8 @@ describe('CLI Smoke Tests', () => {
       assert.ok(output.includes('run [options]'));
       assert.ok(output.includes('swd [options]'));
       assert.ok(output.includes('mcp'));
+      assert.ok(output.includes('runs'));
+      assert.ok(output.includes('policy'));
       assert.ok(output.includes('skills [options]'));
       assert.ok(output.includes('learn [options]'));
       assert.ok(output.includes('init [options]'));

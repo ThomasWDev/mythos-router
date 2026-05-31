@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { applyExternalAgentActions, resolveSandboxChecks } from './commands/swd.js';
+import { validateExternalAgentInput } from './action-schema.js';
 import { formatReceiptMarkdown } from './receipt-markdown.js';
 import {
   listReceipts,
@@ -109,9 +110,30 @@ const textInputSchema: Record<string, Record<string, unknown>> = {
     type: 'object',
     description: 'Optional external-agent metadata included in the input envelope.',
   },
+  contract: {
+    type: 'object',
+    description: 'Optional per-run task contract with allowedPaths, blockedPaths, requiredPaths, and expectedOutputs.',
+  },
 };
 
 export const MCP_TOOLS: MCPTool[] = [
+  {
+    name: 'swd_validate',
+    title: 'Validate external-agent action input',
+    description:
+      'Validates Mythos external-agent JSON or FILE_ACTION input without writing files, receipts, or run history.',
+    inputSchema: {
+      type: 'object',
+      properties: textInputSchema,
+    },
+    annotations: {
+      title: 'SWD validate',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
   {
     name: 'swd_dry_run',
     title: 'Preview external-agent file actions through SWD',
@@ -154,16 +176,20 @@ export const MCP_TOOLS: MCPTool[] = [
         },
         check: {
           type: 'array',
-          description: 'Command(s) to run in an isolated copy before applying. Changes are applied only if every check passes. Same trust level as a shell command.',
+          description: 'Trusted shell command(s) to run in an isolated copy before applying. Changes are applied only if every check passes.',
           items: { type: 'string' },
         },
         runChecks: {
           type: 'boolean',
-          description: 'Run the checks declared in .mythos/policy.json in an isolated copy before applying. Declared checks never run unless this is true.',
+          description: 'Run trusted checks declared in .mythos/policy.json in an isolated copy before applying. Declared checks never run unless this is true.',
         },
         saveReceipt: {
           type: 'boolean',
           description: 'Write a local SWD receipt for successful non-dry-run applies. Defaults to true.',
+        },
+        saveRun: {
+          type: 'boolean',
+          description: 'Write a local run history record for non-dry-run applies. Defaults to true.',
         },
         rollback: {
           type: 'boolean',
@@ -287,6 +313,12 @@ export const MCP_TOOLS: MCPTool[] = [
 ];
 
 const TOOL_HANDLERS: Record<string, ToolHandler> = {
+  swd_validate: (args) => {
+    const rawInput = externalAgentInputFromArgs(args);
+    const output = validateExternalAgentInput(rawInput);
+    return toolResult(output, !output.ok);
+  },
+
   swd_dry_run: async (args) => {
     const rawInput = externalAgentInputFromArgs(args);
     const output = await applyExternalAgentActions({
@@ -315,6 +347,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
       saveReceipt: dryRun ? false : optionalBoolean(args.saveReceipt, 'saveReceipt') ?? true,
       allowRisky: optionalBoolean(args.allowRisky, 'allowRisky') ?? false,
       enableRollback: optionalBoolean(args.rollback, 'rollback') ?? true,
+      saveRun: dryRun ? false : optionalBoolean(args.saveRun, 'saveRun') ?? true,
       request: optionalString(args.request, 'request'),
       summary: optionalString(args.summary, 'summary'),
       agentId: optionalString(args.agentId, 'agentId'),
@@ -530,6 +563,7 @@ function externalAgentInputFromArgs(args: Record<string, unknown>): string {
       model: optionalString(args.modelId, 'modelId'),
     },
     metadata: optionalRecord(args.metadata, 'metadata'),
+    contract: optionalRecord(args.contract, 'contract'),
     actions: args.actions,
   });
 }

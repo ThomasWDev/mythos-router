@@ -1,0 +1,10 @@
+{
+  "actions": [
+    {
+      "path": "../outside.txt",
+      "operation": "CREATE",
+      "description": "Invalid path traversal",
+      "content": "must be rejected\n"
+    }
+  ]
+}

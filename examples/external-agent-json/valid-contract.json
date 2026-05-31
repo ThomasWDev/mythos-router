@@ -1,0 +1,21 @@
+{
+  "request": "contract-gated external-agent edit",
+  "agent": {
+    "id": "example-agent",
+    "model": "custom-model"
+  },
+  "contract": {
+    "allowedPaths": ["src/**", "test/**"],
+    "blockedPaths": ["**/.env*", "contracts/mainnet/**"],
+    "expectedOutputs": ["src/example.ts"]
+  },
+  "actions": [
+    {
+      "path": "src/example.ts",
+      "operation": "CREATE",
+      "intent": "MUTATE",
+      "description": "Create example source file",
+      "content": "export const example = true;\n"
+    }
+  ]
+}

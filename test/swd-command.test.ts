@@ -50,8 +50,10 @@ created through cli
       assert.equal(parsed.agent.id, 'pytest-agent');
       assert.equal(parsed.agent.model, 'custom-model');
       assert.equal(parsed.receipt.id.startsWith('swd-'), true);
+      assert.equal(parsed.run.id.startsWith('run-'), true);
       assert.equal(readFileSync(join(tempDir, 'cli-created.txt'), 'utf-8'), 'created through cli');
       assert.equal(existsSync(join(tempDir, '.mythos', 'receipts', `${parsed.receipt.id}.json`)), true);
+      assert.equal(existsSync(join(tempDir, '.mythos', 'runs', `${parsed.run.id}.json`)), true);
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
@@ -77,8 +79,45 @@ created through cli
       assert.equal(parsed.ok, true);
       assert.equal(parsed.mode, 'dry-run');
       assert.equal(parsed.receipt, undefined);
+      assert.equal(parsed.run, undefined);
       assert.equal(existsSync(join(tempDir, 'dry.txt')), false);
       assert.equal(existsSync(join(tempDir, '.mythos', 'receipts')), false);
+      assert.equal(existsSync(join(tempDir, '.mythos', 'runs')), false);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('validates a contract-gated JSON envelope without writing files', () => {
+    const repoRoot = process.cwd();
+    const tempDir = mkdtempSync(join(tmpdir(), 'mythos-swd-validate-'));
+    const cliPath = join(repoRoot, 'src', 'cli.ts');
+    const tsxLoader = pathToFileURL(join(repoRoot, 'node_modules', 'tsx', 'dist', 'loader.mjs')).href;
+    const input = JSON.stringify({
+      contract: {
+        allowedPaths: ['src/**'],
+        expectedOutputs: ['src/validated.ts'],
+      },
+      actions: [{
+        path: 'src/validated.ts',
+        operation: 'CREATE',
+        content: 'export const validated = true;\n',
+        description: 'validated create',
+      }],
+    });
+
+    try {
+      const output = execFileSync(
+        process.execPath,
+        ['--import', tsxLoader, cliPath, 'swd', 'validate', '--stdin', '--json'],
+        { cwd: tempDir, input, encoding: 'utf-8' },
+      );
+      const parsed = JSON.parse(output);
+
+      assert.equal(parsed.ok, true);
+      assert.equal(parsed.contract.ok, true);
+      assert.equal(existsSync(join(tempDir, 'src', 'validated.ts')), false);
+      assert.equal(existsSync(join(tempDir, '.mythos')), false);
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }

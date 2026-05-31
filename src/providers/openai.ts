@@ -15,6 +15,12 @@ export interface OpenAIProviderConfig {
   defaultModel: string;      // e.g. 'gpt-4o', 'deepseek-chat'
   supportsThinking?: boolean; // DeepSeek reasoner, o1/o3 have reasoning
   /**
+   * Whether to send `stream_options: { include_usage: true }` on streaming
+   * requests. OpenAI and DeepSeek support it (so we get real token counts),
+   * but some OpenAI-compatible servers reject unknown fields. Defaults to true.
+   */
+  includeUsageStreamOption?: boolean;
+  /**
    * Reasoning models (OpenAI o1/o3/o4 family) require `max_completion_tokens`
    * instead of `max_tokens` and reject the `system` role. Auto-detected from
    * the model name when omitted; set explicitly to override detection.
@@ -51,6 +57,7 @@ export class OpenAIProvider implements BaseProvider {
   private defaultModel: string;
   private supportsThinking: boolean;
   private reasoningModel: boolean;
+  private includeUsage: boolean;
 
   constructor(config: OpenAIProviderConfig) {
     this.id = config.id;
@@ -59,6 +66,7 @@ export class OpenAIProvider implements BaseProvider {
     this.defaultModel = config.defaultModel;
     this.supportsThinking = config.supportsThinking ?? false;
     this.reasoningModel = config.reasoningModel ?? detectReasoningModel(config.defaultModel);
+    this.includeUsage = config.includeUsageStreamOption ?? true;
 
     const caps: ProviderCapability[] = ['streaming'];
     if (this.supportsThinking) caps.push('thinking');
@@ -102,8 +110,11 @@ export class OpenAIProvider implements BaseProvider {
     if (stream) {
       body.stream = true;
       // Ask OpenAI-compatible APIs to emit a final usage chunk so we report
-      // real token counts instead of a char/4 estimate.
-      body.stream_options = { include_usage: true };
+      // real token counts instead of a char/4 estimate. Disabled via config
+      // for servers that reject unknown request fields.
+      if (this.includeUsage) {
+        body.stream_options = { include_usage: true };
+      }
     }
 
     return body;
@@ -212,6 +223,11 @@ export class OpenAIProvider implements BaseProvider {
       outputTokens = Math.ceil((responseText.length + thinkingText.length) / 4);
     }
 
+    // A response with no text and no reasoning is not a usable success; flag it
+    // incomplete so the orchestrator falls back instead of returning emptiness.
+    const aborted = !!options.signal?.aborted;
+    const empty = responseText.trim().length === 0 && thinkingText.trim().length === 0;
+
     return {
       thinking: thinkingText,
       text: responseText,
@@ -225,7 +241,7 @@ export class OpenAIProvider implements BaseProvider {
         providerId: this.id,
         modelId: model,
         fallbackTriggered: false,
-        incomplete: !!options.signal?.aborted,
+        incomplete: aborted || empty,
       },
     };
   }
@@ -293,7 +309,7 @@ export class OpenAIProvider implements BaseProvider {
         providerId: this.id,
         modelId: model,
         fallbackTriggered: false,
-        incomplete: false,
+        incomplete: responseText.trim().length === 0 && thinkingText.trim().length === 0,
       },
     };
   }

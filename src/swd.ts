@@ -3,7 +3,7 @@
 //  Strict Write Discipline — Production API (v1)
 // ─────────────────────────────────────────────────────────────
 
-import { readFileSync, writeFileSync, statSync, existsSync, unlinkSync, realpathSync } from 'node:fs';
+import { readFileSync, writeFileSync, statSync, existsSync, unlinkSync, realpathSync, mkdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { resolve, relative, isAbsolute, dirname, basename } from 'node:path';
 
@@ -45,6 +45,14 @@ export interface SWDOptions {
   dryRun?: boolean;
   strict?: boolean;
   enableRollback?: boolean;
+  /**
+   * Maximum size (bytes) of an existing file that MODIFY/DELETE may target.
+   * The original content is held in memory to enable rollback, so oversized
+   * targets are blocked fail-closed instead of risking memory pressure.
+   * Defaults to MAX_ROLLBACK_SNAPSHOT_BYTES. Raise it only when you knowingly
+   * mutate large files and have the memory headroom.
+   */
+  maxSnapshotBytes?: number;
   // Hook System for Extensibility
   onAction?: (action: FileAction) => void;
   onVerify?: (result: ActionResult) => void;
@@ -71,6 +79,23 @@ export interface FileSnapshotSummary {
 
 export const MAX_WRITABLE_ACTION_CONTENT_BYTES = 200_000;
 
+// Existing files larger than this are refused for MODIFY/DELETE because their
+// original content would have to be held in memory for rollback. Generous
+// enough that ordinary source files never hit it.
+export const MAX_ROLLBACK_SNAPSHOT_BYTES = 50_000_000;
+
+/** Size of an existing file in bytes, or 0 if missing/unreadable. */
+function existingFileSize(unsafePath: string): number {
+  try {
+    const abs = resolveSafePath(unsafePath);
+    if (!existsSync(abs)) return 0;
+    return statSync(abs).size;
+  } catch {
+    // Path errors are surfaced later by executeAction; treat as non-blocking here.
+    return 0;
+  }
+}
+
 function getWritableActionContentBytes(action: FileAction): number {
   if (!['CREATE', 'MODIFY'].includes(action.operation) || action.content === undefined) return 0;
   return Buffer.byteLength(action.content, 'utf8');
@@ -93,6 +118,7 @@ export class SWDEngine {
       dryRun: options.dryRun ?? false,
       strict: options.strict ?? true,
       enableRollback: options.enableRollback ?? true,
+      maxSnapshotBytes: options.maxSnapshotBytes ?? MAX_ROLLBACK_SNAPSHOT_BYTES,
       onAction: options.onAction ?? (() => {}),
       onVerify: options.onVerify ?? (() => {}),
       onRollback: options.onRollback ?? (() => {}),
@@ -123,6 +149,32 @@ export class SWDEngine {
       };
     }
 
+    // Preflight: block MODIFY/DELETE of existing files too large to snapshot
+    // for rollback. We only stat() here (no content read), so an oversized
+    // target is never loaded into memory.
+    const oversizedSnapshotFailures = actions
+      .filter(action => action.operation === 'MODIFY' || action.operation === 'DELETE')
+      .map(action => ({ action, size: existingFileSize(action.path) }))
+      .filter(({ size }) => size > this.options.maxSnapshotBytes)
+      .map(({ action, size }) => ({
+        action,
+        status: 'failed' as VerificationStatus,
+        detail:
+          `Refusing to ${action.operation} ${action.path}: existing file is ${size} bytes, ` +
+          `exceeding the rollback snapshot cap of ${this.options.maxSnapshotBytes}. ` +
+          `Large files can't be safely held in memory for rollback.`,
+      }));
+
+    if (oversizedSnapshotFailures.length > 0) {
+      return {
+        success: false,
+        results: oversizedSnapshotFailures,
+        rolledBack: false,
+        rollbackErrors: [],
+        errors: oversizedSnapshotFailures.map(r => r.detail),
+      };
+    }
+
     const context = new InternalSessionContext();
     const results: ActionResult[] = [];
     const rollbackErrors: string[] = [];
@@ -135,41 +187,64 @@ export class SWDEngine {
       }
 
       // 2. EXECUTE
+      // A throw here (e.g. ENOENT, CREATE-on-existing, permission error) must
+      // NOT bypass rollback. We capture the failure, stop executing further
+      // actions, and fall through to the rollback stage so any writes that
+      // already succeeded in this batch are reverted.
+      let executionError: string | null = null;
       if (!this.options.dryRun) {
         for (const action of actions) {
           this.options.onAction(action);
-          this.executeAction(action);
-          context.logExecution(action);
+          try {
+            this.executeAction(action);
+            context.logExecution(action);
+          } catch (err: any) {
+            executionError = err instanceof Error ? err.message : String(err);
+            overallSuccess = false;
+            const failed: ActionResult = {
+              action,
+              status: 'failed',
+              detail: executionError,
+              before: summarizeSnapshot(context.getSnapshot(action.path, 'before')),
+            };
+            results.push(failed);
+            this.options.onVerify(failed);
+            break;
+          }
         }
       }
 
       // 3. SNAPSHOT_AFTER + VERIFY
-      for (const action of actions) {
-        // In dry run, we cannot verify filesystem outcomes.
-        if (this.options.dryRun) {
-          const res: ActionResult = {
-            action,
-            status: 'verified',
-            detail: `Dry-run: planned ${action.operation} ${action.path} (not applied)`
-          };
-          results.push(res);
-          this.options.onVerify(res);
-          continue;
-        }
+      // Skipped when execution already threw — there is nothing more to verify,
+      // and the partially-applied batch is about to be rolled back.
+      if (!executionError) {
+        for (const action of actions) {
+          // In dry run, we cannot verify filesystem outcomes.
+          if (this.options.dryRun) {
+            const res: ActionResult = {
+              action,
+              status: 'verified',
+              detail: `Dry-run: planned ${action.operation} ${action.path} (not applied)`
+            };
+            results.push(res);
+            this.options.onVerify(res);
+            continue;
+          }
 
-        const verification = this.verifyInternal(action, context);
-        
-        // Intent reinforcement
-        if (action.intent === 'MUTATE' && verification.status === 'noop') {
-          verification.status = 'failed';
-          verification.detail = `Intent mismatch: Expected mutation on ${action.path} but file remained identical.`;
-        }
+          const verification = this.verifyInternal(action, context);
 
-        results.push(verification);
-        this.options.onVerify(verification);
+          // Intent reinforcement
+          if (action.intent === 'MUTATE' && verification.status === 'noop') {
+            verification.status = 'failed';
+            verification.detail = `Intent mismatch: Expected mutation on ${action.path} but file remained identical.`;
+          }
 
-        if (verification.status === 'failed' || (this.options.strict && verification.status === 'drift')) {
-          overallSuccess = false;
+          results.push(verification);
+          this.options.onVerify(verification);
+
+          if (verification.status === 'failed' || (this.options.strict && verification.status === 'drift')) {
+            overallSuccess = false;
+          }
         }
       }
 
@@ -202,7 +277,13 @@ export class SWDEngine {
           if (existsSync(absPath)) {
             throw new Error(`CREATE failed: file already exists at ${action.path}`);
           }
-          if (action.content !== undefined) writeFileSync(absPath, action.content);
+          if (action.content !== undefined) {
+            // Ensure the parent directory exists so CREATE can target a new
+            // subdirectory. This mirrors the sandbox apply path and keeps the
+            // isolated-check gate equivalent to the real apply.
+            mkdirSync(dirname(absPath), { recursive: true });
+            writeFileSync(absPath, action.content);
+          }
           break;
         case 'MODIFY':
           if (!existsSync(absPath)) {
@@ -457,9 +538,15 @@ export function parseActions(output: string): FileAction[] {
         continue;
       }
 
-      let resolvedIntent: ActionIntent = 'MUTATE';
-      if (intent?.toUpperCase() === 'NOOP') resolvedIntent = 'NOOP';
-      if (intent?.toUpperCase() === 'UNKNOWN') resolvedIntent = 'UNKNOWN';
+      const intentUpper = intent?.toUpperCase();
+      let resolvedIntent: ActionIntent;
+      if (intentUpper === 'NOOP') resolvedIntent = 'NOOP';
+      else if (intentUpper === 'UNKNOWN') resolvedIntent = 'UNKNOWN';
+      else if (intentUpper === 'MUTATE') resolvedIntent = 'MUTATE';
+      // No explicit intent: a READ is inherently a no-op; everything else is a
+      // mutation. This mirrors the JSON action normalizer and prevents a raw
+      // READ block (no INTENT line) from failing as a MUTATE/noop mismatch.
+      else resolvedIntent = opUpper === 'READ' ? 'NOOP' : 'MUTATE';
 
       actions.push({
         path,

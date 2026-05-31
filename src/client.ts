@@ -64,8 +64,8 @@ export function getOrchestrator(): ProviderOrchestrator {
         new OpenAIProvider({
           id: 'openai',
           apiKey: providers.openai,
-          baseUrl: 'https://api.openai.com/v1',
-          defaultModel: 'gpt-4o',
+          baseUrl: process.env.MYTHOS_OPENAI_BASE_URL?.trim() || 'https://api.openai.com/v1',
+          defaultModel: process.env.MYTHOS_OPENAI_MODEL?.trim() || 'gpt-4o',
         }),
         { priority: providers.anthropic ? 1 : 0 },
       );
@@ -77,8 +77,8 @@ export function getOrchestrator(): ProviderOrchestrator {
         new OpenAIProvider({
           id: 'deepseek',
           apiKey: providers.deepseek,
-          baseUrl: 'https://api.deepseek.com/v1',
-          defaultModel: 'deepseek-chat',
+          baseUrl: process.env.MYTHOS_DEEPSEEK_BASE_URL?.trim() || 'https://api.deepseek.com/v1',
+          defaultModel: process.env.MYTHOS_DEEPSEEK_MODEL?.trim() || 'deepseek-chat',
           supportsThinking: true,
         }),
         { priority: providers.anthropic || providers.openai ? 2 : 0 },

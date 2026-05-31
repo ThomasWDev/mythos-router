@@ -6,9 +6,16 @@ import { createSWDReceipt, saveSWDReceipt, redactReceiptSecrets, type ReceiptPro
 import { isGitRepo, getCurrentBranch, getLatestHash } from '../git.js';
 import { runActionsInSandbox, type SandboxCheck } from '../sandbox.js';
 import { loadProjectPolicy, getDeclaredChecks } from '../project-policy.js';
+import {
+  MAX_AGENT_INPUT_BYTES,
+  parseExternalAgentEnvelope,
+  validateExternalAgentInput,
+  validateTaskContractForActions,
+  type TaskContract,
+  type TaskContractValidation,
+} from '../action-schema.js';
+import { saveRunRecord } from '../runs.js';
 import { c, error as logError, success as logSuccess, warn as logWarn } from '../utils.js';
-
-const MAX_AGENT_INPUT_BYTES = 1_000_000;
 
 export interface ExternalAgentInput {
   actions: FileAction[];
@@ -19,6 +26,7 @@ export interface ExternalAgentInput {
     model?: string;
   };
   metadata?: Record<string, unknown>;
+  contract?: TaskContract;
 }
 
 export interface RejectedAction {
@@ -43,6 +51,8 @@ export interface SandboxSummary {
   setupError?: string;
 }
 
+export type TaskContractSummary = TaskContractValidation;
+
 export interface SWDApplyResult {
   ok: boolean;
   mode: 'apply' | 'dry-run';
@@ -59,6 +69,12 @@ export interface SWDApplyResult {
     model: string;
   };
   sandbox?: SandboxSummary;
+  contract?: TaskContractSummary;
+  run?: {
+    id: string;
+    path: string;
+  };
+  runLogError?: string;
 }
 
 interface SWDCommandOptions {
@@ -76,6 +92,7 @@ interface SWDCommandOptions {
   model?: string;
   check?: string[];
   runChecks?: boolean;
+  runLog?: boolean;
 }
 
 interface ApplyExternalAgentOptions {
@@ -91,6 +108,7 @@ interface ApplyExternalAgentOptions {
   modelId?: string;
   checks?: SandboxCheck[];
   checkTimeoutMs?: number;
+  saveRun?: boolean;
 }
 
 function getReceiptGitContext(): { branch?: string; commit?: string } | undefined {
@@ -244,15 +262,15 @@ function parseJsonAgentInput(rawInput: string): ExternalAgentInput | null {
 }
 
 export function parseExternalAgentInput(rawInput: string): ExternalAgentInput {
-  if (Buffer.byteLength(rawInput, 'utf8') > MAX_AGENT_INPUT_BYTES) {
-    throw new Error(`External agent input exceeds ${MAX_AGENT_INPUT_BYTES} bytes.`);
-  }
-
-  const parsedJson = parseJsonAgentInput(rawInput);
-  if (parsedJson) return parsedJson;
-
-  const actions = parseActions(rawInput);
-  return { actions };
+  const parsed = parseExternalAgentEnvelope(rawInput);
+  return {
+    actions: parsed.actions,
+    request: parsed.request,
+    summary: parsed.summary,
+    agent: parsed.agent,
+    metadata: parsed.metadata,
+    contract: parsed.contract,
+  };
 }
 
 function rejectedFromReview(review: ReturnType<typeof reviewActions>): RejectedAction[] {
@@ -286,9 +304,46 @@ export async function applyExternalAgentActions(options: ApplyExternalAgentOptio
   const modelId = options.modelId ?? input.agent?.model ?? 'external';
   const dryRun = options.dryRun ?? false;
   const saveReceipt = options.saveReceipt ?? !dryRun;
+  const saveRun = options.saveRun ?? !dryRun;
+  const request = options.request ?? input.request ?? `external-agent:${agentId}:${sha256(options.rawInput).slice(0, 12)}`;
+  const summary = options.summary ?? input.summary ?? summarizeFileActions(actions);
 
   if (actions.length === 0) {
     throw new Error('No valid file actions were found in external agent input.');
+  }
+
+  const contractSummary = input.contract
+    ? validateTaskContractForActions(actions, input.contract)
+    : undefined;
+
+  const finalize = (output: SWDApplyResult): SWDApplyResult => {
+    if (contractSummary) output.contract = contractSummary;
+    if (saveRun && !dryRun) {
+      try {
+        output.run = saveRunRecord(output, { request, summary });
+      } catch (err) {
+        output.runLogError = redactReceiptSecrets(err instanceof Error ? err.message : String(err));
+      }
+    }
+    return output;
+  };
+
+  if (contractSummary && !contractSummary.ok) {
+    return finalize({
+      ok: false,
+      mode: dryRun ? 'dry-run' : 'apply',
+      actionCount: actions.length,
+      approvedCount: 0,
+      rejected: [],
+      result: {
+        success: false,
+        results: [],
+        rolledBack: false,
+        rollbackErrors: [],
+        errors: contractSummary.errors,
+      },
+      agent: { id: agentId, model: modelId },
+    });
   }
 
   const review = reviewActions(actions);
@@ -296,7 +351,7 @@ export async function applyExternalAgentActions(options: ApplyExternalAgentOptio
   const approved = options.allowRisky ? [...review.approved, ...review.needsConfirmation.map(({ action }) => action)] : review.approved;
 
   if (review.blocked.length > 0) {
-    return {
+    return finalize({
       ok: false,
       mode: dryRun ? 'dry-run' : 'apply',
       actionCount: actions.length,
@@ -310,11 +365,11 @@ export async function applyExternalAgentActions(options: ApplyExternalAgentOptio
         errors: review.blocked.map(({ verdict }) => verdict.reason),
       },
       agent: { id: agentId, model: modelId },
-    };
+    });
   }
 
   if (!options.allowRisky && review.needsConfirmation.length > 0) {
-    return {
+    return finalize({
       ok: false,
       mode: dryRun ? 'dry-run' : 'apply',
       actionCount: actions.length,
@@ -328,7 +383,7 @@ export async function applyExternalAgentActions(options: ApplyExternalAgentOptio
         errors: review.needsConfirmation.map(({ verdict }) => verdict.reason),
       },
       agent: { id: agentId, model: modelId },
-    };
+    });
   }
 
     // ── Isolated-run gate ────────────────────────────────────────
@@ -361,7 +416,7 @@ export async function applyExternalAgentActions(options: ApplyExternalAgentOptio
         ...sandboxSummary.checks.filter((check) => !check.passed).map((check) => `Sandbox check failed: ${check.name}`),
         ...(sandboxSummary.setupError ? [`Sandbox setup failed: ${sandboxSummary.setupError}`] : []),
       ];
-      return {
+      return finalize({
         ok: false,
         mode: 'apply',
         actionCount: actions.length,
@@ -376,7 +431,7 @@ export async function applyExternalAgentActions(options: ApplyExternalAgentOptio
         },
         agent: { id: agentId, model: modelId },
         sandbox: sandboxSummary,
-      };
+      });
     }
   }
 
@@ -408,11 +463,9 @@ export async function applyExternalAgentActions(options: ApplyExternalAgentOptio
   if (sandboxSummary) output.sandbox = sandboxSummary;
 
   if (saveReceipt) {
-    const request = options.request ?? input.request ?? `external-agent:${agentId}:${sha256(options.rawInput).slice(0, 12)}`;
-    const summary = options.summary ?? input.summary ?? summarizeFileActions(approved);
     const receipt = createSWDReceipt({
       request,
-      summary,
+      summary: options.summary ?? input.summary ?? summarizeFileActions(approved),
       result,
       provider: providerForAgent(agentId, modelId),
       git: getReceiptGitContext(),
@@ -423,7 +476,7 @@ export async function applyExternalAgentActions(options: ApplyExternalAgentOptio
     };
   }
 
-  return output;
+  return finalize(output);
 }
 
 async function readStdinBounded(): Promise<string> {
@@ -477,6 +530,15 @@ function printHumanResult(output: SWDApplyResult): void {
     }
   }
 
+  if (output.contract) {
+    if (output.contract.ok) {
+      console.log(`${c.dim}Task contract:${c.reset} ${c.green}passed${c.reset}`);
+    } else {
+      console.log(`${c.dim}Task contract:${c.reset} ${c.red}failed${c.reset}`);
+      for (const err of output.contract.errors) logError(err);
+    }
+  }
+
   for (const result of output.result.results) {
     const ok = result.status === 'verified' || result.status === 'noop';
     const prefix = ok ? `${c.green}✔${c.reset}` : `${c.red}✗${c.reset}`;
@@ -487,11 +549,38 @@ function printHumanResult(output: SWDApplyResult): void {
     console.log(`${c.dim}Receipt: ${c.cyan}mythos receipts show ${output.receipt.id}${c.reset}`);
   }
 
+  if (output.run) {
+    console.log(`${c.dim}Run: ${c.cyan}mythos runs show ${output.run.id}${c.reset}`);
+  } else if (output.runLogError) {
+    logWarn(`Run record was not saved: ${output.runLogError}`);
+  }
+
   if (output.ok) {
     logSuccess(`SWD ${output.mode === 'dry-run' ? 'dry-run' : 'apply'} verified (${output.approvedCount}/${output.actionCount} actions).`);
   } else {
     logError(`SWD ${output.mode === 'dry-run' ? 'dry-run' : 'apply'} failed.`);
     for (const err of output.result.errors) logError(err);
+  }
+}
+
+function printValidationResult(validation: ReturnType<typeof validateExternalAgentInput>): void {
+  if (validation.ok) {
+    logSuccess(`External-agent input is valid (${validation.actionCount} action${validation.actionCount === 1 ? '' : 's'}, ${validation.format}).`);
+  } else {
+    logError('External-agent input is invalid.');
+    for (const err of validation.errors) logError(err);
+  }
+
+  if (validation.contract) {
+    const status = validation.contract.ok ? `${c.green}passed${c.reset}` : `${c.red}failed${c.reset}`;
+    console.log(`${c.dim}Task contract:${c.reset} ${status}`);
+    if (validation.contract.expectedOutputs.length > 0) {
+      console.log(`${c.dim}Expected outputs:${c.reset} ${validation.contract.expectedOutputs.join(', ')}`);
+    }
+  }
+
+  for (const warning of validation.warnings) {
+    logWarn(warning);
   }
 }
 
@@ -518,8 +607,8 @@ export function resolveSandboxChecks(options: Pick<SWDCommandOptions, 'check' | 
 }
 
 export async function swdCommand(action = 'apply', options: SWDCommandOptions): Promise<void> {
-  if (action !== 'apply') {
-    const message = `Unknown swd action "${action}". Supported: apply.`;
+  if (action !== 'apply' && action !== 'validate') {
+    const message = `Unknown swd action "${action}". Supported: apply, validate.`;
     if (options.json) console.log(JSON.stringify({ ok: false, error: message }, null, 2));
     else logError(message);
     process.exitCode = 1;
@@ -528,6 +617,18 @@ export async function swdCommand(action = 'apply', options: SWDCommandOptions): 
 
   try {
     const rawInput = await resolveInput(options);
+
+    if (action === 'validate') {
+      const validation = validateExternalAgentInput(rawInput);
+      if (options.json) {
+        console.log(JSON.stringify(validation, null, 2));
+      } else {
+        printValidationResult(validation);
+      }
+      if (!validation.ok) process.exitCode = 1;
+      return;
+    }
+
     const checks = resolveSandboxChecks(options);
     if (checks.length > 0 && options.dryRun) {
       logWarn('Checks are skipped in --dry-run (no commands are executed during a preview).');
@@ -544,6 +645,7 @@ export async function swdCommand(action = 'apply', options: SWDCommandOptions): 
       agentId: options.agent,
       modelId: options.model,
       checks,
+      saveRun: options.dryRun ? false : options.runLog ?? true,
     });
 
     if (options.json) {

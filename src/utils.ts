@@ -373,26 +373,59 @@ export interface TestResult {
   output: string;
 }
 
-export function runTestCommand(cmd: string, timeoutMs = 15000, cwd: string = process.cwd()): Promise<TestResult> {
+export function runTestCommand(cmd: string, timeoutMs = 120000, cwd: string = process.cwd()): Promise<TestResult> {
   return new Promise((resolve) => {
     let finished = false;
-    
+
     const safeResolve = (result: TestResult) => {
       if (finished) return;
       finished = true;
       resolve(result);
     };
 
-    const child = spawn(cmd, { shell: true, cwd });
+    const isWindows = process.platform === 'win32';
+    const child = spawn(cmd, {
+      shell: true,
+      cwd,
+      windowsHide: true,
+      // On POSIX, detaching makes the shell a process-group leader so we can
+      // signal the whole group (grandchildren included) on timeout instead of
+      // orphaning the real test process when we kill only the shell.
+      detached: !isWindows,
+    });
+
+    // Bound memory during long/chatty runs: keep only the most recent output.
+    const MAX_LIVE_OUTPUT = 1_000_000;
     let output = '';
-    
+    let truncatedLive = false;
+    const append = (chunk: string) => {
+      output += chunk;
+      if (output.length > MAX_LIVE_OUTPUT) {
+        output = output.slice(-MAX_LIVE_OUTPUT);
+        truncatedLive = true;
+      }
+    };
+
+    const killTree = (signal: NodeJS.Signals) => {
+      try {
+        if (!isWindows && typeof child.pid === 'number') {
+          process.kill(-child.pid, signal); // negative pid → whole process group
+        } else {
+          child.kill(signal);
+        }
+      } catch {
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      }
+    };
+
     const timer = setTimeout(() => {
-      child.kill('SIGKILL');
+      killTree('SIGKILL');
       safeResolve({ passed: false, output: `[TIMEOUT] Test exceeded ${timeoutMs}ms and was killed.` });
     }, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
 
-    child.stdout.on('data', (data) => output += data.toString());
-    child.stderr.on('data', (data) => output += data.toString());
+    child.stdout?.on('data', (data) => append(data.toString()));
+    child.stderr?.on('data', (data) => append(data.toString()));
 
     child.on('error', (err) => {
       clearTimeout(timer);
@@ -408,8 +441,8 @@ export function runTestCommand(cmd: string, timeoutMs = 15000, cwd: string = pro
 
       const maxLen = 2000;
       let finalOutput = output;
-      
-      if (output.length > maxLen) {
+
+      if (truncatedLive || output.length > maxLen) {
         const head = output.slice(0, 500);
         const tail = output.slice(-1500);
         finalOutput = `${head}\n\n...[TRUNCATED]...\n\n${tail}`;

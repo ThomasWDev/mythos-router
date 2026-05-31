@@ -53,11 +53,12 @@ export class AnthropicProvider implements BaseProvider {
       if (typeof m.content !== 'string') {
         throw new Error(`Message[${i}] content must be a string`);
       }
-      const trimmed = m.content.trim();
-      if (trimmed.length === 0) {
+      if (m.content.trim().length === 0) {
         throw new Error(`Empty message content at message[${i}]`);
       }
-      return { role: m.role, content: trimmed };
+      // Preserve exact content — trimming could alter whitespace-significant
+      // prompts (fenced code, trailing newlines) the user sent deliberately.
+      return { role: m.role, content: m.content };
     });
   }
 
@@ -179,7 +180,8 @@ export class AnthropicProvider implements BaseProvider {
         providerId: this.id,
         modelId: model,
         fallbackTriggered: false,
-        incomplete: false,
+        // No text and no reasoning is an unusable success; flag for fallback.
+        incomplete: responseText.trim().length === 0 && thinkingText.trim().length === 0,
       },
     };
   }
@@ -235,7 +237,7 @@ export class AnthropicProvider implements BaseProvider {
         providerId: this.id,
         modelId: model,
         fallbackTriggered: false,
-        incomplete: false,
+        incomplete: responseText.trim().length === 0 && thinkingText.trim().length === 0,
       },
     };
   }

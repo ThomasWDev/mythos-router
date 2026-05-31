@@ -322,7 +322,7 @@ function firstMatchingPattern(patterns: string[], normalizedPath: string): strin
   return null;
 }
 
-function matchesPolicyPattern(pattern: string, normalizedPath: string): boolean {
+export function matchesPolicyPattern(pattern: string, normalizedPath: string): boolean {
   const patternSegments = normalizePolicyPath(pattern).split('/').filter(Boolean);
   const pathSegments = normalizePolicyPath(normalizedPath).split('/').filter(Boolean);
   const memo = new Map<string, boolean>();
@@ -383,7 +383,7 @@ function matchSegment(pattern: string, text: string): boolean {
   return patternIndex === p.length;
 }
 
-function normalizePolicyPath(filePath: string): string {
+export function normalizePolicyPath(filePath: string): string {
   let normalized = filePath.split('\\').join('/').trim();
 
   if (normalized.startsWith('./')) {

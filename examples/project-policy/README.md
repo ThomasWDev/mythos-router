@@ -41,6 +41,15 @@ The example policy:
 
 Path patterns are matched case-insensitively by path segment. `*` matches within one segment, and `**` matches across path segments.
 
+## Ask Mythos For Suggestions
+
+```bash
+mythos policy suggest
+mythos policy suggest --json
+```
+
+This is read-only. It inspects repo structure and prints possible block/confirm patterns for surfaces such as workflows, mainnet contracts, env files, deploy scripts, payments, and production infrastructure. It never writes `.mythos/policy.json` automatically.
+
 ## Try The Blocked Action
 
 ```bash
@@ -79,3 +88,6 @@ mythos swd apply --file actions.json --json --check "npm test"
 If any check fails, the apply is rejected and the real tree is untouched.
 Checks are skipped during `--dry-run`. This keeps a cloned untrusted repo's
 policy file from triggering command execution on its own.
+
+Checks are trusted shell commands. Review them like package scripts or CI
+commands, and do not derive them from untrusted agent output.

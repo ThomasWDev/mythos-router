@@ -92,12 +92,45 @@ export {
   projectPolicyTemplate,
   evaluateProjectPolicyAction,
   evaluateProjectPolicyBatch,
+  matchesPolicyPattern,
+  normalizePolicyPath,
   type ProjectPolicy,
   type ProjectPolicyLimits,
   type ProjectPolicyState,
   type ProjectPolicyDecision,
   type ProjectPolicyOperation,
 } from './project-policy.js';
+
+export {
+  EXTERNAL_AGENT_ACTION_SCHEMA,
+  EXTERNAL_AGENT_ACTION_SCHEMA_ID,
+  EXTERNAL_AGENT_ACTION_SCHEMA_VERSION,
+  MAX_AGENT_INPUT_BYTES,
+  parseExternalAgentEnvelope,
+  validateExternalAgentInput,
+  validateTaskContractForActions,
+  type ExternalAgentActionEnvelope,
+  type ExternalAgentValidation,
+  type TaskContract,
+  type TaskContractValidation,
+} from './action-schema.js';
+
+export {
+  suggestProjectPolicy,
+  type PolicySuggestion,
+  type PolicySuggestionResult,
+  type PolicySuggestionRisk,
+} from './policy-suggestions.js';
+
+export {
+  getRunsDir,
+  listRuns,
+  readRun,
+  saveRunRecord,
+  type RunFileSummary,
+  type RunRecord,
+  type RunSummary,
+} from './runs.js';
 
 // Export SWD Receipts
 export {
@@ -133,7 +166,7 @@ export { MODELS, CAPYBARA_SYSTEM_PROMPT, getEffort, validateApiKey, validateProv
 // Export the Chat UI Interface (for custom frontends)
 export { type ChatUI } from './commands/chat.js';
 
-export { parseExternalAgentInput, applyExternalAgentActions, type ExternalAgentInput, type SWDApplyResult } from './commands/swd.js';
+export { parseExternalAgentInput, applyExternalAgentActions, type ExternalAgentInput, type SWDApplyResult, type TaskContractSummary } from './commands/swd.js';
 
 // Export the MCP adapter for embedded hosts and tests
 export {

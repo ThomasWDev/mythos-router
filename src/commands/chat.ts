@@ -206,7 +206,7 @@ class ChatSession {
         }
       );
 
-      this.budget.record(response.usage.inputTokens, response.usage.outputTokens);
+      this.budget.record(response.usage.inputTokens, response.usage.outputTokens, response.metadata.modelId);
 
       this.history = [
         { role: 'user', content: `[CONTEXT SUMMARY OF PREVIOUS TURNS]\n${response.text}` },
@@ -264,8 +264,14 @@ class ChatSession {
       );
 
       this.ui.write('\n');
+      // In non-TTY contexts (piped output, CI), streamed deltas are suppressed,
+      // so `mythos run "..." > out.txt` would otherwise print no answer at all.
+      // Echo the final text once here for those cases.
+      if (!process.stdout.isTTY && response.text.trim().length > 0) {
+        this.ui.write(response.text + '\n');
+      }
       this.history.push({ role: 'assistant', content: response.text });
-      this.budget.record(response.usage.inputTokens, response.usage.outputTokens);
+      this.budget.record(response.usage.inputTokens, response.usage.outputTokens, response.metadata.modelId);
 
       if (this.options.verbose) printVerboseParse(response.text);
 
@@ -559,7 +565,7 @@ class ChatSession {
 
         this.ui.write('\n');
         this.history.push({ role: 'assistant', content: response.text });
-        this.budget.record(response.usage.inputTokens, response.usage.outputTokens);
+        this.budget.record(response.usage.inputTokens, response.usage.outputTokens, response.metadata.modelId);
 
         const correctionActions = parseActions(response.text);
         warnIfMalformedFileActionOutput(response.text, correctionActions.length, this.ui);
@@ -628,9 +634,14 @@ class ChatSession {
     return null;
   }
 
+  private resolveTestTimeoutMs(): number {
+    // Default 120s — long enough for real suites/builds. Overridable via --test-timeout.
+    return parsePositiveInt(this.options.testTimeout, 120_000);
+  }
+
   private async runTestAttempt(cmd: string, attempt: number, maxRetries: number): Promise<{ passed: boolean; output: string }> {
     this.ui.startLoading(`Running tests: ${c.cyan}${cmd}${c.reset}...`);
-    const result = await runTestCommand(cmd);
+    const result = await runTestCommand(cmd, this.resolveTestTimeoutMs());
 
     if (result.passed) {
       this.ui.stopLoading();
@@ -687,7 +698,7 @@ class ChatSession {
 
     this.ui.write('\n');
     this.history.push({ role: 'assistant', content: response.text });
-    this.budget.record(response.usage.inputTokens, response.usage.outputTokens);
+    this.budget.record(response.usage.inputTokens, response.usage.outputTokens, response.metadata.modelId);
     return response.text;
   }
 
@@ -851,6 +862,7 @@ interface ChatOptions {
   branch?: string;
   testCmd?: string;
   maxTestRetries?: string;
+  testTimeout?: string;
   skill?: string | string[];
   provider?: string;
   fallback?: boolean;
@@ -877,7 +889,12 @@ export async function chatCommand(options: ChatOptions): Promise<void> {
   // ── Resume previous session if requested ────────────────
   if (options.resume) {
     const saved = loadSession();
-    if (saved) {
+    const currentProject = path.basename(process.cwd());
+    if (saved && saved.project && saved.project !== currentProject) {
+      ui.warn(
+        `Last saved session was for project "${saved.project}", not "${currentProject}". Starting fresh to avoid cross-project context.`,
+      );
+    } else if (saved) {
       session.history = saved.history;
       // Re-record previous budget usage so the limiter is aware
       session.budget.restore(saved.budget.inputTokens, saved.budget.outputTokens, saved.budget.turns);
@@ -976,6 +993,10 @@ export async function chatCommand(options: ChatOptions): Promise<void> {
   rl.prompt();
 
   rl.on('line', async (line) => {
+    // Pause input while this turn is handled so a second pasted/typed line
+    // cannot start a concurrent turn and interleave history/budget mutations.
+    // Every terminal path below re-prompts (which resumes) or closes the stream.
+    rl.pause();
     const input = line.trim();
     if (!input) { rl.prompt(); return; }
 

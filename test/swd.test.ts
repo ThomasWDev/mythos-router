@@ -196,4 +196,115 @@ describe('SWDEngine (Production v1 API)', () => {
 
     rmSync(testDir, { recursive: true, force: true });
   });
+
+  it('Creates files inside a non-existent nested directory', async () => {
+    mkdirSync(testDir, { recursive: true });
+    const nested = join(testDir, 'newdir', 'deep', 'nested.txt');
+    const engine = new SWDEngine();
+
+    const result = await engine.run([{
+      path: nested,
+      operation: 'CREATE',
+      intent: 'MUTATE',
+      content: 'created in a fresh directory',
+      description: 'nested create'
+    }]);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.results[0]?.status, 'verified');
+    assert.strictEqual(existsSync(nested), true);
+    assert.strictEqual(readFileSync(nested, 'utf-8'), 'created in a fresh directory');
+
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('Rolls back earlier writes when a later action throws during execution', async () => {
+    mkdirSync(testDir, { recursive: true });
+    const fileA = join(testDir, 'exec-rollback-a.txt');
+    const fileB = join(testDir, 'exec-rollback-b.txt');
+    // fileB already exists, so the second CREATE will throw mid-batch.
+    writeFileSync(fileB, 'pre-existing', 'utf-8');
+
+    const engine = new SWDEngine({ enableRollback: true });
+
+    const result = await engine.run([
+      {
+        path: fileA,
+        operation: 'CREATE',
+        intent: 'MUTATE',
+        content: 'should be rolled back',
+        description: 'first action that succeeds'
+      },
+      {
+        path: fileB,
+        operation: 'CREATE',
+        intent: 'MUTATE',
+        content: 'never written',
+        description: 'second action that throws (already exists)'
+      }
+    ]);
+
+    assert.strictEqual(result.success, false);
+    assert.strictEqual(result.rolledBack, true);
+    assert.match(result.errors.join('\n'), /already exists/);
+    // The earlier successful write must be undone.
+    assert.strictEqual(existsSync(fileA), false);
+    // The pre-existing file must be untouched.
+    assert.strictEqual(readFileSync(fileB, 'utf-8'), 'pre-existing');
+
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('Blocks MODIFY of a file larger than the rollback snapshot cap', async () => {
+    mkdirSync(testDir, { recursive: true });
+    const big = join(testDir, 'big.txt');
+    writeFileSync(big, 'X'.repeat(100), 'utf-8'); // 100 bytes
+    const engine = new SWDEngine({ maxSnapshotBytes: 10 }); // cap below file size
+
+    const result = await engine.run([{
+      path: big,
+      operation: 'MODIFY',
+      intent: 'MUTATE',
+      content: 'replacement',
+      description: 'modify an oversized file'
+    }]);
+
+    assert.strictEqual(result.success, false);
+    assert.strictEqual(result.rolledBack, false);
+    assert.match(result.errors.join('\n'), /rollback snapshot cap/);
+    // Original content untouched — we never even opened it for writing.
+    assert.strictEqual(readFileSync(big, 'utf-8'), 'X'.repeat(100));
+
+    rmSync(testDir, { recursive: true, force: true });
+  });
+});
+
+describe('parseActions intent defaults', () => {
+  it('defaults a READ block without an INTENT line to NOOP', () => {
+    const output = [
+      '[FILE_ACTION: src/read-me.ts]',
+      'OPERATION: READ',
+      'DESCRIPTION: inspect a file',
+      '[/FILE_ACTION]',
+    ].join('\n');
+
+    const actions = parseActions(output);
+    assert.strictEqual(actions.length, 1);
+    assert.strictEqual(actions[0].operation, 'READ');
+    assert.strictEqual(actions[0].intent, 'NOOP');
+  });
+
+  it('still defaults a CREATE block without an INTENT line to MUTATE', () => {
+    const output = [
+      '[FILE_ACTION: src/new.ts]',
+      'OPERATION: CREATE',
+      'DESCRIPTION: add a file',
+      'CONTENT:',
+      'export const x = 1;',
+      '[/FILE_ACTION]',
+    ].join('\n');
+
+    const actions = parseActions(output);
+    assert.strictEqual(actions[0].intent, 'MUTATE');
+  });
 });

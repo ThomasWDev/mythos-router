@@ -5,11 +5,11 @@
 //
 //  Security model:
 //  - The sandbox is a mirror copy of the project in a 0700 temp dir.
-//  - node_modules is symlinked (not copied) so checks run without a
-//    reinstall; .git / dist are excluded as regenerable/irrelevant.
+//  - Project symlinks are skipped rather than dereferenced into the copy.
+//  - node_modules is symlinked only when it is a project-local directory so
+//    checks run without a reinstall; .git / dist are excluded.
 //  - Every write is jailed: the resolved real path of the target's
-//    parent MUST stay inside the sandbox root, so a copied symlink
-//    cannot redirect a write outside the jail.
+//    parent MUST stay inside the sandbox root.
 //  - Check commands are NEVER derived from untrusted content. They are
 //    only the explicit, caller-supplied commands (same trust level as
 //    the existing --test-cmd escape hatch). A policy file alone never
@@ -22,6 +22,7 @@
 import {
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -121,6 +122,13 @@ function mirrorTree(src: string, dest: string): number {
       const fromPath = join(fromDir, entry.name);
       const toPath = join(toDir, entry.name);
 
+      if (entry.isSymbolicLink()) {
+        // Do not dereference repository symlinks into the sandbox. A link may
+        // point outside the project, and importing that target would surprise
+        // both the check runner and supply-chain scanners.
+        continue;
+      }
+
       if (entry.isDirectory()) {
         mkdirSync(toPath, { recursive: true });
         walk(fromPath, toPath);
@@ -131,11 +139,11 @@ function mirrorTree(src: string, dest: string): number {
             `Add large directories to .gitignore/.mythosignore or skip isolated runs.`,
           );
         }
-        // cpSync preserves contents; symlinks are dereferenced into regular
-        // files here, which is safe because we never write through them.
-        cpSync(fromPath, toPath, { dereference: true });
+        // Real file contents only. No dereference flag: symlinks were already
+        // excluded above, so there is no link for cpSync to follow.
+        cpSync(fromPath, toPath);
       }
-      // Sockets/FIFOs/devices are intentionally not mirrored.
+      // Symlinks, sockets, FIFOs, and devices are intentionally not mirrored.
     }
   };
 
@@ -147,9 +155,16 @@ function mirrorTree(src: string, dest: string): number {
 function linkNodeModules(root: string, sandbox: string): void {
   const realModules = join(root, 'node_modules');
   if (!existsSync(realModules)) return;
+  if (lstatSync(realModules).isSymbolicLink()) return;
+
+  const realRoot = realpathSync(root);
+  const realModulesPath = realpathSync(realModules);
+  const rel = relative(realRoot, realModulesPath);
+  if (rel.startsWith('..') || isAbsolute(rel)) return;
+
   const linkType = process.platform === 'win32' ? 'junction' : 'dir';
   try {
-    symlinkSync(realpathSync(realModules), join(sandbox, 'node_modules'), linkType);
+    symlinkSync(realModulesPath, join(sandbox, 'node_modules'), linkType);
   } catch {
     // Non-fatal: checks may still work, just slower / may need install.
   }
