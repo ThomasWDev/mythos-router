@@ -50,3 +50,7 @@ jobs:
 
       - name: Run Tests
         run: npm test
+
+      - name: Coverage Report
+        if: matrix.os == 'ubuntu-latest' && matrix.node == 22
+        run: npm run test:coverage
