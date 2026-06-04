@@ -449,6 +449,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Correction Turns** — max 2 retries before yielding to human.
 - **Dream/Verify Commands** — memory compression and drift detection.
 
+[1.17.0]: https://github.com/thewaltero/mythos-router/releases/tag/v1.17.0
 [1.16.0]: https://github.com/thewaltero/mythos-router/releases/tag/v1.16.0
 [1.15.0]: https://github.com/thewaltero/mythos-router/releases/tag/v1.15.0
 [1.14.0]: https://github.com/thewaltero/mythos-router/releases/tag/v1.14.0
