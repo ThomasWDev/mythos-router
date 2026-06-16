@@ -309,11 +309,22 @@ describe('CLI Smoke Tests', () => {
       assert.equal(verified.files[0].status, 'ok');
 
       writeFileSync(absPath, 'changed', 'utf-8');
-      const drifted = JSON.parse(execFileSync(
-        process.execPath,
-        [cliPath, 'receipts', 'verify', receipt.id, '--json'],
-        { cwd: tempDir, encoding: 'utf-8' },
-      ));
+      // verify now exits non-zero on drift (fail-closed), so execFileSync throws.
+      // The JSON report is still printed to stdout; read it off the error object.
+      let driftErr: any;
+      try {
+        execFileSync(
+          process.execPath,
+          [cliPath, 'receipts', 'verify', receipt.id, '--json'],
+          { cwd: tempDir, encoding: 'utf-8' },
+        );
+        assert.fail('receipts verify should exit non-zero when the file has drifted');
+      } catch (e: any) {
+        if (e?.code === 'ERR_ASSERTION') throw e;
+        driftErr = e;
+      }
+      assert.notEqual(driftErr.status, 0, 'drift should produce a non-zero exit code');
+      const drifted = JSON.parse(driftErr.stdout);
       assert.equal(drifted.ok, false);
       assert.equal(drifted.files[0].status, 'drifted');
     } catch (err: any) {
