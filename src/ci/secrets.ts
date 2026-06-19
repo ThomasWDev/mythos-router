@@ -43,6 +43,25 @@ const SECRET_PATTERNS: SecretPattern[] = [
     recommendation: 'Remove the API key, rotate it, and load it from a local environment variable or CI secret.',
   },
   {
+    // Catch-all for OpenAI-compatible `sk-` keys that are NOT the branded
+    // variants above (e.g. DeepSeek, legacy OpenAI `sk-`/`sk-svcacct-`, and
+    // other OpenAI-compatible providers). The negative lookahead skips
+    // `sk-ant-`/`sk-proj-` so those are reported once by their dedicated rule
+    // rather than double-counted here. Alphanumeric-only with a 20-char floor
+    // keeps this high-confidence: ordinary identifiers like `sk-button-large`
+    // never reach the required run length.
+    id: 'generic-sk-key',
+    title: 'Generic API key found (sk- prefix)',
+    regex: /\bsk-(?!ant-|proj-)[A-Za-z0-9]{20,}\b/,
+    recommendation: 'Remove the API key (e.g. OpenAI or DeepSeek), rotate it, and load it from a local environment variable or CI secret.',
+  },
+  {
+    id: 'surplus-key',
+    title: 'Surplus API key found',
+    regex: /\binf_[A-Za-z0-9]{20,}\b/,
+    recommendation: 'Remove the Surplus API key, rotate it, and load it from a local environment variable or CI secret.',
+  },
+  {
     id: 'evm-private-key-assignment',
     title: 'EVM private key assignment found',
     regex: /\b(?:PRIVATE_KEY|WALLET_PRIVATE_KEY|DEPLOYER_PRIVATE_KEY)\s*=\s*["']?0x[a-fA-F0-9]{64}\b/,
@@ -63,6 +82,11 @@ function redactEvidence(line: string): string {
     .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, '[GITHUB_TOKEN]')
     .replace(/\bsk-ant-[A-Za-z0-9_-]{16,}\b/g, '[ANTHROPIC_API_KEY]')
     .replace(/\bsk-proj-[A-Za-z0-9_-]{16,}\b/g, '[OPENAI_API_KEY]')
+    // Must run after the branded sk- rules above so `sk-ant-`/`sk-proj-` are
+    // already redacted to their specific labels and never fall through to the
+    // generic one. The lookahead is a second line of defense if reordered.
+    .replace(/\bsk-(?!ant-|proj-)[A-Za-z0-9]{20,}\b/g, '[API_KEY]')
+    .replace(/\binf_[A-Za-z0-9]{20,}\b/g, '[SURPLUS_API_KEY]')
     .replace(/0x[a-fA-F0-9]{64}\b/g, '[EVM_PRIVATE_KEY]');
 }
 
