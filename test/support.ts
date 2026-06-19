@@ -73,7 +73,16 @@ export async function withTempCwd<T>(fn: (dir: string) => Promise<T> | T): Promi
     return await fn(dir);
   } finally {
     process.chdir(previousCwd);
-    rmSync(dir, { recursive: true, force: true });
+    // Best-effort teardown. On Windows a directory that just held a git repo
+    // or a subprocess working dir can keep open handles for a moment, making
+    // rmSync throw EBUSY/EPERM/ENOTEMPTY (which `force` alone does not retry).
+    // Retry briefly, then ignore — a cleanup hiccup must never fail an
+    // otherwise-passing test; the OS reclaims the temp dir regardless.
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    } catch {
+      /* ignore */
+    }
   }
 }
 

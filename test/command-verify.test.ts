@@ -7,7 +7,14 @@ import { verifyCommand } from '../src/commands/verify.js';
 import { captureRun, withTempCwd } from './support.js';
 
 function git(cwd: string, args: string[]): void {
-  execFileSync('git', ['-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', ...args], {
+  execFileSync('git', [
+    '-c', 'commit.gpgsign=false',
+    '-c', 'core.hooksPath=/dev/null',
+    '-c', 'core.autocrlf=false',  // keep LF fixtures byte-identical so diffs are deterministic on Windows
+    '-c', 'core.fsmonitor=false', // no background fsmonitor process holding .git handles
+    '-c', 'gc.auto=0',            // no background gc locking .git during teardown
+    ...args,
+  ], {
     cwd,
     stdio: 'ignore',
   });
