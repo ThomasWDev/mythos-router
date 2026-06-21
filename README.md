@@ -34,11 +34,11 @@ npx mythos-router chat
 
 ## What is this?
 
-**mythos-router** is a local CLI power tool that wraps Claude Opus 4.8 with a custom verification protocol called **Strict Write Discipline (SWD)**.
+**mythos-router** is a local CLI power tool built around **Strict Write Discipline (SWD)**: a verification layer that checks every file operation an AI agent *claims* to perform against the actual filesystem using SHA-256 snapshots. If a claim doesn't match reality, the batch is rolled back so a bad write never half-lands, and successful runs leave a hash-chained, tamper-evident receipt.
 
-Unlike standard Claude wrappers, mythos-router enforces filesystem verification: every file operation the AI claims to perform is *checked against the actual filesystem using SHA-256 snapshots*. If the model's claim doesn't match reality, it gets a Correction Turn. If it fails twice, it yields to the human.
+The key idea is that **the trust boundary is the filesystem, not the model**. That makes SWD model-agnostic: it ships with a built-in Claude Opus 4.8 agent (`mythos chat` / `mythos run`), but the same engine verifies file actions from *any* agent — GPT, DeepSeek, a local model, or your own script — with no Mythos model key, over stdin/JSON, the SDK, or MCP. See [`examples/verified-writes`](examples/verified-writes/) for a runnable "the agent hallucinated a write, SWD caught it" demo.
 
-Zero slop. Zero hallucinated state. Full adaptive thinking.
+Zero slop. Zero hallucinated state. Every write verified.
 
 ---
 
@@ -57,7 +57,7 @@ Zero slop. Zero hallucinated state. Full adaptive thinking.
 |  **Adaptive Thinking** | Opus 4.8 with configurable effort levels (high/medium/low) |
 |  **Strict Write Discipline** | Pre/post filesystem snapshots verify every model or external-agent file claim |
 |  **Isolated Runs** | `swd apply --check <cmd>` / `--run-checks` test a batch in a throwaway copy and apply it to the real tree only if checks pass — the real tree is never left broken |
-|  **SWD Receipts** | Per-run trust receipts record touched files, hashes, provider/external-agent id, budget, git state, and verification result |
+|  **SWD Receipts** | Per-run trust receipts record touched files, hashes, provider/external-agent id, budget, git state, and verification result. Receipts are **hash-chained** (append-only): each links to the previous one, so deletion, reordering, or forgery is detectable — not just in-place edits |
 |  **Receipt Undo** | `receipts undo <id\|latest>` replays a verified receipt in reverse — previews by default, `--yes` to apply, drift-gated so it never overwrites newer edits, and produces its own receipt |
 |  **Project Policy** | `.mythos/policy.json` adds enforced repo-local SWD guardrails for sensitive project surfaces |
 |  **Self-Healing Memory** | Authority-based logging with a rebuildable SQLite FTS5 search index *(Node 22+)* |
@@ -139,6 +139,7 @@ Small, runnable examples are available in [`examples/`](examples/):
 
 | Example | Purpose |
 |---------|---------|
+| [`verified-writes`](examples/verified-writes/) | Route any agent's file claims through SWD (stdin/JSON, SDK, or MCP) — includes a runnable agent-hallucination demo |
 | [`external-agent-json`](examples/external-agent-json/) | Submit structured file actions through `mythos swd apply` without a Mythos model key |
 | [`mcp-stdio`](examples/mcp-stdio/) | Configure an MCP client to launch `mythos mcp` over local stdio |
 | [`project-policy`](examples/project-policy/) | Add enforced repo-local SWD block/confirm rules with `.mythos/policy.json` |
@@ -416,10 +417,11 @@ mythos receipts show latest  # Inspect the newest receipt
 mythos receipts show latest --markdown  # PR-ready Markdown summary
 mythos receipts show latest --format markdown  # Same output, useful for tooling parity with MCP
 mythos receipts verify latest  # Re-check current files against receipt hashes
+mythos receipts verify         # Verify all receipts AND the append-only chain
 mythos receipts --json       # Machine-readable output for tooling
 ```
 
-Every non-dry-run SWD file operation writes a local receipt to `.mythos/receipts/`. Receipts include the request summary, provider or external-agent/model identity, git branch/commit, per-file before/after hashes, rollback status, and verification errors. Built-in `chat`/`run` receipts also include token usage, budget snapshot, active skill packs, and optional `--test-cmd` result. `verify` turns those receipts into a quick drift check for "did the files still match what SWD verified?" `--markdown`, `--pr`, or `--format markdown` prints a compact paste-ready receipt summary for PR reviews, especially useful when a write failed or rolled back. Receipts are local by default and gitignored by default. They may include prompts, file paths, provider metadata, skill names, test command names, and a short test output tail. Do not publish raw receipts from private repositories; force-add only when you intentionally want a shared audit trail.
+Every non-dry-run SWD file operation writes a local receipt to `.mythos/receipts/`. Receipts include the request summary, provider or external-agent/model identity, git branch/commit, per-file before/after hashes, rollback status, and verification errors. Built-in `chat`/`run` receipts also include token usage, budget snapshot, active skill packs, and optional `--test-cmd` result. `verify` turns those receipts into a quick drift check for "did the files still match what SWD verified?" and, when run over all receipts, also verifies the **append-only hash chain** — each receipt links to the previous one's hash, so a deleted, reordered, or forged receipt breaks the chain and is reported (the per-receipt integrity hash on its own only catches in-place edits). `--markdown`, `--pr`, or `--format markdown` prints a compact paste-ready receipt summary for PR reviews, especially useful when a write failed or rolled back. Receipts are local by default and gitignored by default. They may include prompts, file paths, provider metadata, skill names, test command names, and a short test output tail. Do not publish raw receipts from private repositories; force-add only when you intentionally want a shared audit trail.
 
 ### `mythos verify` — Local Memory Scan + CI Verification
 
@@ -482,6 +484,8 @@ Tracks every penny spent across all your projects. Costs are aggregated by:
 - **Command** (e.g., `chat` vs `dream`)
 - **Project** (directory name)
 - **Time Period**
+
+When a session ran file actions, `stats` also reports an **SWD Verification** summary: how many actions verified, how many claims were caught failing disk verification, correction turns, and the overall misreport rate — a measured "how often did the agent misreport a write" number rather than an asserted one.
 
 Data is stored locally in `~/.mythos-router/metrics.json`.
 
