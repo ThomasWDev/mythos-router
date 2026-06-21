@@ -5,7 +5,7 @@
 
 import { readFileSync, writeFileSync, statSync, existsSync, unlinkSync, realpathSync, mkdirSync, rmdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { resolve, relative, isAbsolute, dirname, basename } from 'node:path';
+import { resolve, relative, isAbsolute, dirname, basename, sep } from 'node:path';
 
 // ── Public Types ─────────────────────────────────────────────
 export type ActionIntent = 'MUTATE' | 'NOOP' | 'UNKNOWN';
@@ -521,7 +521,16 @@ export function resolveSafePath(unsafePath: string): string {
   }
 
   const relPath = relative(cwd, realPath);
-  if (relPath.startsWith('..') || isAbsolute(relPath)) {
+  // Segment-based escape check. `startsWith('..')` would wrongly reject a
+  // legitimately-named file like `..foo.txt` (relPath === '..foo.txt'); only a
+  // real parent-escape — relPath of exactly '..' or a '..' path *segment* —
+  // should fail. This matches the segment check in parseActions(), so the two
+  // validators agree.
+  const escapesRoot =
+    relPath === '..' ||
+    relPath.startsWith(`..${sep}`) ||
+    relPath.startsWith('../');
+  if (escapesRoot || isAbsolute(relPath)) {
     throw new Error(`SECURITY VIOLATION: Path traversal detected on '${unsafePath}'.`);
   }
   return realPath;
@@ -581,6 +590,30 @@ function lastLineStartIndexBefore(s: string, needle: string, from: number, limit
     idx = nextLineStartIndex(s, needle, idx + 1);
   }
   return best;
+}
+
+// Shared field validation, used by both the text-block parser and the
+// structured tool-call normalizer so the two input paths apply identical
+// safety rules. Segment-based: 'a/../b' is rejected, but a filename that merely
+// contains '..' (e.g. 'backup..old.txt') is allowed. resolveSafePath()
+// re-validates at execution time regardless.
+function isPathShapeSafe(path: string): boolean {
+  if (path.trim() === '' || path.length > 500 || path.includes('\0')) return false;
+  const segments = path.split(/[\\/]+/);
+  if (segments.some(segment => segment === '..')) return false;
+  if (path.startsWith('/') || isAbsolute(path)) return false;
+  return true;
+}
+
+function resolveActionIntent(operationUpper: string, intent?: string): ActionIntent {
+  const intentUpper = intent?.toUpperCase();
+  if (intentUpper === 'NOOP') return 'NOOP';
+  if (intentUpper === 'UNKNOWN') return 'UNKNOWN';
+  if (intentUpper === 'MUTATE') return 'MUTATE';
+  // No explicit intent: a READ is inherently a no-op; everything else is a
+  // mutation. This mirrors the JSON action normalizer and prevents a raw READ
+  // (no intent) from failing as a MUTATE/noop mismatch.
+  return operationUpper === 'READ' ? 'NOOP' : 'MUTATE';
 }
 
 export function parseActions(output: string): FileAction[] {
@@ -659,18 +692,8 @@ export function parseActions(output: string): FileAction[] {
     }
 
     if (path && operation && description) {
-      // Traversal check is segment-based: 'a/../b' is rejected, but a
-      // legitimate filename that merely contains '..' (e.g. 'backup..old.txt')
-      // is not. resolveSafePath() re-validates at execution time regardless.
-      const segments = path.split(/[\\/]+/);
-      if (
-        path.trim() === '' ||
-        path.length > 500 ||
-        path.includes('\0') ||
-        segments.some(segment => segment === '..') ||
-        path.startsWith('/') ||
-        isAbsolute(path)
-      ) {
+      // Segment-based traversal check shared with the tool-call normalizer.
+      if (!isPathShapeSafe(path)) {
         continue;
       }
 
@@ -679,20 +702,10 @@ export function parseActions(output: string): FileAction[] {
         continue;
       }
 
-      const intentUpper = intent?.toUpperCase();
-      let resolvedIntent: ActionIntent;
-      if (intentUpper === 'NOOP') resolvedIntent = 'NOOP';
-      else if (intentUpper === 'UNKNOWN') resolvedIntent = 'UNKNOWN';
-      else if (intentUpper === 'MUTATE') resolvedIntent = 'MUTATE';
-      // No explicit intent: a READ is inherently a no-op; everything else is a
-      // mutation. This mirrors the JSON action normalizer and prevents a raw
-      // READ block (no INTENT line) from failing as a MUTATE/noop mismatch.
-      else resolvedIntent = opUpper === 'READ' ? 'NOOP' : 'MUTATE';
-
       actions.push({
         path,
         operation: opUpper as FileAction['operation'],
-        intent: resolvedIntent,
+        intent: resolveActionIntent(opUpper, intent),
         contentHash,
         description,
         content,
@@ -702,7 +715,56 @@ export function parseActions(output: string): FileAction[] {
   return actions;
 }
 
-// ── Summary Helper ───────────────────────────────────────────
+// ── Native tool-call input ───────────────────────────────────
+export interface ToolCallFileAction {
+  path: string;
+  operation: string;
+  intent?: string;
+  description?: string;
+  content?: string;
+  contentHash?: string;
+}
+
+/**
+ * Normalize native tool/function-calling arguments into validated FileActions,
+ * applying the SAME path-safety and field rules as parseActions(). A provider
+ * that supports structured tool calls (Anthropic, OpenAI) can emit the
+ * FILE_ACTION envelope as JSON arguments and route it through SWD without
+ * re-implementing validation. The verification trust boundary is unchanged —
+ * SWD still computes the SHA-256 from disk and rolls back on mismatch — only
+ * the input format differs. Invalid entries are dropped; oversized content is
+ * left for SWDEngine.run() to reject with a clean failure (not silently lost).
+ */
+export function actionsFromToolCalls(raw: ToolCallFileAction | ToolCallFileAction[]): FileAction[] {
+  const entries = Array.isArray(raw) ? raw : [raw];
+  const actions: FileAction[] = [];
+
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object') continue;
+
+    const path = typeof entry.path === 'string' ? entry.path.trim() : '';
+    const operation = typeof entry.operation === 'string' ? entry.operation.trim() : '';
+    if (!path || !operation || !isPathShapeSafe(path)) continue;
+
+    const opUpper = operation.toUpperCase();
+    if (!['CREATE', 'MODIFY', 'DELETE', 'READ'].includes(opUpper)) continue;
+
+    const description = typeof entry.description === 'string' && entry.description.trim()
+      ? entry.description.trim()
+      : `${opUpper} ${path}`;
+
+    actions.push({
+      path,
+      operation: opUpper as FileAction['operation'],
+      intent: resolveActionIntent(opUpper, entry.intent),
+      contentHash: typeof entry.contentHash === 'string' ? entry.contentHash : undefined,
+      description,
+      content: typeof entry.content === 'string' ? entry.content : undefined,
+    });
+  }
+
+  return actions;
+}
 export function summarizeActions(output: string, userInput: string): string {
   const actions = parseActions(output);
   return actions.length > 0 ? actions.map(a => `${a.operation}: ${a.path}`).join('; ') : `chat: ${userInput.slice(0, 80)}`;

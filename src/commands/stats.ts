@@ -6,6 +6,68 @@ interface StatsOptions {
   json?: boolean;
 }
 
+export interface AggregatedStats {
+  totalCost: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalTurns: number;
+  swdVerified: number;
+  swdFailed: number;
+  swdCorrectionTurns: number;
+  swdTotalActions: number;
+  swdFailRate: number;
+  costByCommand: Record<string, number>;
+  costByProject: Record<string, number>;
+}
+
+/**
+ * Pure reduction over session metrics. Extracted from statsCommand so the
+ * cost + SWD-verification aggregation can be unit-tested without touching the
+ * on-disk metrics store or the home directory.
+ */
+export function aggregateSessionMetrics(metrics: SessionMetric[]): AggregatedStats {
+  let totalCost = 0;
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let totalTurns = 0;
+  let swdVerified = 0;
+  let swdFailed = 0;
+  let swdCorrectionTurns = 0;
+  const costByCommand: Record<string, number> = {};
+  const costByProject: Record<string, number> = {};
+
+  for (const m of metrics) {
+    totalCost += m.costUSD;
+    totalInputTokens += m.inputTokens;
+    totalOutputTokens += m.outputTokens;
+    totalTurns += m.turns;
+    if (m.swd) {
+      swdVerified += m.swd.actionsVerified;
+      swdFailed += m.swd.actionsFailed;
+      swdCorrectionTurns += m.swd.correctionTurns;
+    }
+    costByCommand[m.command] = (costByCommand[m.command] || 0) + m.costUSD;
+    costByProject[m.project] = (costByProject[m.project] || 0) + m.costUSD;
+  }
+
+  const swdTotalActions = swdVerified + swdFailed;
+  const swdFailRate = swdTotalActions > 0 ? (swdFailed / swdTotalActions) * 100 : 0;
+
+  return {
+    totalCost,
+    totalInputTokens,
+    totalOutputTokens,
+    totalTurns,
+    swdVerified,
+    swdFailed,
+    swdCorrectionTurns,
+    swdTotalActions,
+    swdFailRate,
+    costByCommand,
+    costByProject,
+  };
+}
+
 export async function statsCommand(options: StatsOptions): Promise<void> {
   const allMetrics = loadSessionMetrics();
   const asJson = options.json === true;
@@ -31,22 +93,19 @@ export async function statsCommand(options: StatsOptions): Promise<void> {
     }
   }
 
-  let totalCost = 0;
-  let totalInputTokens = 0;
-  let totalOutputTokens = 0;
-  let totalTurns = 0;
-  const costByCommand: Record<string, number> = {};
-  const costByProject: Record<string, number> = {};
-
-  for (const m of metrics) {
-    totalCost += m.costUSD;
-    totalInputTokens += m.inputTokens;
-    totalOutputTokens += m.outputTokens;
-    totalTurns += m.turns;
-
-    costByCommand[m.command] = (costByCommand[m.command] || 0) + m.costUSD;
-    costByProject[m.project] = (costByProject[m.project] || 0) + m.costUSD;
-  }
+  const {
+    totalCost,
+    totalInputTokens,
+    totalOutputTokens,
+    totalTurns,
+    swdVerified,
+    swdFailed,
+    swdCorrectionTurns,
+    swdTotalActions,
+    swdFailRate,
+    costByCommand,
+    costByProject,
+  } = aggregateSessionMetrics(metrics);
 
   if (asJson) {
     console.log(JSON.stringify({
@@ -56,6 +115,12 @@ export async function statsCommand(options: StatsOptions): Promise<void> {
       totalInputTokens,
       totalOutputTokens,
       totalCostUSD: Number(totalCost.toFixed(6)),
+      swdVerification: {
+        actionsVerified: swdVerified,
+        actionsFailed: swdFailed,
+        correctionTurns: swdCorrectionTurns,
+        failRatePercent: Number(swdFailRate.toFixed(2)),
+      },
       byCommand: costByCommand,
       byProject: costByProject,
     }, null, 2));
@@ -79,6 +144,17 @@ export async function statsCommand(options: StatsOptions): Promise<void> {
   console.log(`  Output Tokens  : ${theme.info}${totalOutputTokens.toLocaleString()}${c.reset}`);
   console.log(`  Total Cost     : ${theme.warning}$${totalCost.toFixed(4)}${c.reset}`);
   console.log('');
+
+  // SWD Verification — the headline trust metric: how often the model's file
+  // claims matched reality, and how often SWD had to correct them.
+  if (swdTotalActions > 0) {
+    console.log(`${c.bold}SWD Verification${c.reset}`);
+    console.log(`  Actions Verified : ${theme.info}${swdVerified.toLocaleString()}${c.reset}`);
+    console.log(`  Claims Caught    : ${theme.warning}${swdFailed.toLocaleString()}${c.reset} ${theme.muted}(failed disk verification)${c.reset}`);
+    console.log(`  Correction Turns : ${theme.info}${swdCorrectionTurns.toLocaleString()}${c.reset}`);
+    console.log(`  Misreport Rate   : ${theme.warning}${swdFailRate.toFixed(2)}%${c.reset} ${theme.muted}(of ${swdTotalActions.toLocaleString()} verified actions)${c.reset}`);
+    console.log('');
+  }
 
   // Cost by Command
   console.log(`${c.bold}Cost by Command${c.reset}`);

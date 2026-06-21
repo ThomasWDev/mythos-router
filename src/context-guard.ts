@@ -101,6 +101,11 @@ export function messagesToFitTokenTarget(
 export const CONTEXT_TOKEN_LIMIT = 150_000;
 export const RESPONSE_TOKEN_BUFFER = 8192; // headroom reserved for the model's reply
 export const MAX_HISTORY_MESSAGES = 120;
+// Compression never folds away the freshest turns: the most recent exchanges
+// are the ones most relevant to the current task, and keeping them raw (rather
+// than summarized) is what limits "summary-of-summary" fidelity loss over long
+// sessions. If the history is smaller than this, it simply isn't compressed.
+export const MIN_RECENT_MESSAGES_KEPT = 3;
 
 export interface CompressionPlan {
   /** Number of oldest messages to compress/drop (always >= 2 when present). */
@@ -143,7 +148,7 @@ export function planContextCompression(
   if (!overTokenLimit && !overMessageLimit) return null;
 
   const messagesToCompress = Math.min(
-    messageCount - 1, // always keep at least the most recent turn
+    messageCount - MIN_RECENT_MESSAGES_KEPT, // always keep the most recent turns raw
     Math.max(
       Math.floor(messageCount * MIN_COMPRESSION_FRACTION),
       messageCount - (MAX_HISTORY_MESSAGES - 1),

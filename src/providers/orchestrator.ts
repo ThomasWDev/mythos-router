@@ -9,6 +9,7 @@ import {
   type ProviderConfig,
   type ProviderStatus,
   type OrchestrationEvent,
+  ProviderError,
 } from './types.js';
 import { calculateCost } from './pricing.js';
 
@@ -51,6 +52,13 @@ const RETRYABLE_STATUS_CODES = new Set([429, 502, 503, 529]);
 
 export function isRetryableError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
+
+  // Authoritative: a typed ProviderError carries an explicit retryable flag, so
+  // we never have to guess. This is the path providers throw on; everything
+  // below is heuristic fallback for raw SDK/network errors.
+  if (err instanceof ProviderError) {
+    return err.retryable;
+  }
 
   // Prefer a real status code carried on the error object (the Anthropic and
   // OpenAI SDKs both expose `.status`; fetch-style errors may use `.statusCode`
@@ -101,6 +109,14 @@ function extractStatusCode(err: unknown): number | undefined {
 }
 
 function extractFallbackReason(err: unknown): OrchestrationEvent['fallbackReason'] {
+  if (err instanceof ProviderError) {
+    switch (err.kind) {
+      case 'rate_limit': return 'rate_limit';
+      case 'timeout': return 'timeout';
+      case 'network': return 'network_error';
+      default: return 'server_error';
+    }
+  }
   if (!(err instanceof Error)) return 'server_error';
   const msg = err.message.toLowerCase();
   if (msg.includes('429') || msg.includes('rate limit')) return 'rate_limit';
@@ -409,7 +425,16 @@ export class ProviderOrchestrator {
     let primaryProvider = candidates[0]?.provider.id ?? 'none';
     let retryCount = 0;
 
+    // Compute capacity once: if at least one candidate has headroom, skip slots
+    // that filled up between selection and admission so a slot is never pushed
+    // past maxConcurrency under concurrent load. If every candidate is already
+    // full, preserve the existing last-resort fallback (admit anyway).
+    const anyHasCapacity = candidates.some(s => s.activeConcurrency < s.config.maxConcurrency);
+
     for (const slot of candidates) {
+      if (anyHasCapacity && slot.activeConcurrency >= slot.config.maxConcurrency) {
+        continue;
+      }
       // Acquire concurrency slot
       slot.activeConcurrency++;
 
@@ -572,7 +597,12 @@ export class ProviderOrchestrator {
     let primaryProvider = candidates[0]?.provider.id ?? 'none';
     let retryCount = 0;
 
+    const anyHasCapacity = candidates.some(s => s.activeConcurrency < s.config.maxConcurrency);
+
     for (const slot of candidates) {
+      if (anyHasCapacity && slot.activeConcurrency >= slot.config.maxConcurrency) {
+        continue;
+      }
       slot.activeConcurrency++;
 
       try {

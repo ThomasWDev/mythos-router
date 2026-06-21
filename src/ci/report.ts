@@ -76,6 +76,11 @@ export function printCIVerifyReport(report: CIVerifyReport, asJson = false): voi
       `  ${c.dim}Receipts:${c.reset} ${report.receipt.validReceiptCount}/${report.receipt.changedReceiptCount} valid, ` +
       `${report.receipt.coveredChangedFileCount} changed file(s) covered`,
     );
+    if (report.receipt.chainChecked) {
+      console.log(
+        `  ${c.dim}Chain:${c.reset}    ${report.receipt.chainOk ? 'intact' : 'BROKEN'} (${report.receipt.chainLength} linked receipt(s))`,
+      );
+    }
   } else {
     console.log(`  ${c.dim}Receipts:${c.reset} no changed Mythos receipts in this diff`);
   }

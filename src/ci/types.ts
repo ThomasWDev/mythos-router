@@ -48,6 +48,9 @@ export interface CIVerifyReport {
     validReceiptCount: number;
     coveredChangedFileCount: number;
     uncoveredChangedFiles: string[];
+    chainChecked: boolean;
+    chainOk: boolean;
+    chainLength: number;
   };
   findings: CIFinding[];
   summary: {

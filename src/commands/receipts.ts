@@ -3,6 +3,7 @@ import {
   readReceipt,
   verifyReceipt,
   verifyReceiptIntegrity,
+  verifyReceiptChain,
   type ReceiptSummary,
   type SWDReceipt,
 } from '../receipts.js';
@@ -197,9 +198,10 @@ function verifyAllReceipts(asJson?: boolean): void {
       const integrityOk = verifyReceiptIntegrity(receipt);
       return { id: receipt.id, ok: verification.ok, integrityOk, files: verification.files };
     });
-    const allOk = results.every((r) => r.ok && r.integrityOk);
+    const chain = verifyReceiptChain();
+    const allOk = results.every((r) => r.ok && r.integrityOk) && chain.ok;
     if (!allOk) process.exitCode = 1;
-    console.log(JSON.stringify({ count: results.length, ok: allOk, receipts: results }, null, 2));
+    console.log(JSON.stringify({ count: results.length, ok: allOk, chain, receipts: results }, null, 2));
     return;
   }
 
@@ -210,7 +212,20 @@ function verifyAllReceipts(asJson?: boolean): void {
     if (!passed) failed += 1;
     console.log(hr());
   }
-  if (failed === 0) {
+
+  // Chain-level verification: catches deletion, reordering, and forgery that
+  // per-receipt integrity alone cannot.
+  const chain = verifyReceiptChain();
+  if (chain.present) {
+    if (chain.ok) {
+      success(`Receipt chain intact (${chain.length} linked receipt(s)).`);
+    } else {
+      error(`Receipt chain BROKEN: ${chain.reason}`);
+      process.exitCode = 1;
+    }
+  }
+
+  if (failed === 0 && (!chain.present || chain.ok)) {
     success(`All ${receipts.length} receipt(s) verified.`);
   } else {
     error(`${failed} of ${receipts.length} receipt(s) failed verification.`);

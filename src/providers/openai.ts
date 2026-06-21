@@ -5,6 +5,8 @@ import {
   type SendOptions,
   type UnifiedResponse,
   type ProviderCapability,
+  ProviderError,
+  kindFromStatus,
 } from './types.js';
 
 // ── Provider Configuration ───────────────────────────────────
@@ -198,8 +200,9 @@ export class OpenAIProvider implements BaseProvider {
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => 'Unknown error');
-      throw new Error(
-        `[${this.id}] API error ${response.status}: ${errorText}`
+      throw new ProviderError(
+        `[${this.id}] API error ${response.status}: ${errorText}`,
+        { kind: kindFromStatus(response.status), status: response.status, providerId: this.id },
       );
     }
 
@@ -268,8 +271,9 @@ export class OpenAIProvider implements BaseProvider {
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => 'Unknown error');
-      throw new Error(
-        `[${this.id}] API error ${response.status}: ${errorText}`
+      throw new ProviderError(
+        `[${this.id}] API error ${response.status}: ${errorText}`,
+        { kind: kindFromStatus(response.status), status: response.status, providerId: this.id },
       );
     }
 

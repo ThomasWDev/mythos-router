@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.21.0] - 2026-06-21
+
+### Added
+- **Hash-chained, tamper-evident receipts** - SWD receipts are now an append-only hash chain. Each receipt carries a `chain` field (`seq`, `prevHash`) that is part of its hashed payload, and the chain tip is tracked in `.mythos/receipts/chain-head.json`. A new `verifyReceiptChain()` detects what a per-receipt self-hash cannot: a **deleted** or **inserted** receipt (gap in the contiguous `seq` run), a **reordered/forged** receipt (`prevHash` not matching the previous receipt's hash), and a **deleted latest** receipt (HEAD pointer mismatch). `mythos receipts verify` (all) now reports chain status and fails closed on a break; `mythos verify --ci` adds a `high`-severity `mythos-receipt-chain-broken` finding when receipts change in a diff and the chain is broken. Receipts written before this release have no `chain` field and are ignored by the chain check, so upgrading simply starts a fresh chain. Exported from the SDK as `verifyReceiptChain`, `ReceiptChain`, `ChainHead`, `ChainVerification`.
+- **Structured provider errors** - New `ProviderError` class (in `src/providers/types.ts`) carries an explicit `kind` (`rate_limit` / `overloaded` / `server_error` / `network` / `timeout` / `client_error` / `unknown`) and a `retryable` flag. `isRetryableError` and the orchestrator's fallback-reason classifier now key off the typed error first, falling back to the existing status-code / message heuristics only for raw SDK errors. The fetch-based OpenAI/DeepSeek/Surplus provider throws `ProviderError` with the real HTTP status. Exported from the SDK with `kindFromStatus` and `isRetryableKind`.
+- **Native tool-call action normalizer** - `actionsFromToolCalls()` converts a provider's structured tool/function-calling arguments into validated `FileAction`s using the *same* path-safety and field rules as the text `parseActions` parser, so a tool-calling provider can feed SWD without a weaker validation path. The shared validation was factored out of `parseActions` (no behavior change). Exported from the SDK with the `ToolCallFileAction` type.
+- **SWD verification telemetry** - Built-in `chat`/`run` sessions now record a per-session SWD tally (`actionsVerified`, `actionsFailed`, `correctionTurns`) on the saved metric. `mythos stats` shows an **SWD Verification** section — verified actions, claims caught failing disk verification, correction turns, and a measured misreport rate — and `mythos stats --json` includes a `swdVerification` block. The reduction is exported as the pure, testable `aggregateSessionMetrics`. Dry-runs are excluded (they never touch disk).
+- **`examples/verified-writes/`** - A runnable, no-API-key demo (`agent-hallucination-demo.mjs`) showing an external agent claiming a change it never made, SWD catching it, the whole batch rolling back, and a hash-chained receipt — plus recipes for routing any agent through SWD via stdin/JSON, the SDK, or MCP.
+
+### Changed
+- **Concurrency-aware provider admission** - `streamMessage`/`sendMessage` now re-check provider capacity at admission time and skip a slot that filled up between selection and acquisition, so concurrent calls cannot push a provider past its `maxConcurrency`. When every candidate is already full, the existing last-resort fallback is preserved (the call is still served rather than rejected).
+- **Context guard preserves recent turns** - History compression now keeps at least the most recent `MIN_RECENT_MESSAGES_KEPT` (3) turns raw instead of only the latest one, limiting summary-of-summary fidelity loss on long sessions. Small histories below the floor are not compressed.
+- **README reframed around the verification layer** - The "What is this?" section now leads with SWD as a model-agnostic verification layer (filesystem as the trust boundary), with the built-in Claude agent presented as one driver among any-agent stdin/JSON, SDK, and MCP entry points.
+
+### Fixed
+- **`resolveSafePath` traversal check is segment-based** - `resolveSafePath` rejected any resolved relative path *starting with* `..`, which also blocked a legitimately-named file like `..config.txt`. It now rejects only a real `..` path segment (matching the segment-based check already used in `parseActions`, which was fixed in 1.20.0), keeping the two validators consistent. Genuine parent-directory traversal and absolute paths remain rejected.
+
+---
+
 ## [1.20.0] - 2026-06-17
 
 ### Added
@@ -494,6 +513,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Correction Turns** — max 2 retries before yielding to human.
 - **Dream/Verify Commands** — memory compression and drift detection.
 
+[1.21.0]: https://github.com/thewaltero/mythos-router/releases/tag/v1.21.0
 [1.20.0]: https://github.com/thewaltero/mythos-router/releases/tag/v1.20.0
 [1.18.1]: https://github.com/thewaltero/mythos-router/releases/tag/v1.18.1
 [1.18.0]: https://github.com/thewaltero/mythos-router/releases/tag/v1.18.1

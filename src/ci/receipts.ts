@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ChangedFile, CIFinding } from './types.js';
-import { verifyReceiptIntegrity, type SWDReceipt } from '../receipts.js';
+import { verifyReceiptIntegrity, verifyReceiptChain, RECEIPTS_DIR, type SWDReceipt } from '../receipts.js';
 
 export interface ReceiptReview {
   checked: boolean;
@@ -9,6 +9,9 @@ export interface ReceiptReview {
   validReceiptCount: number;
   coveredChangedFileCount: number;
   uncoveredChangedFiles: string[];
+  chainChecked: boolean;
+  chainOk: boolean;
+  chainLength: number;
   findings: CIFinding[];
 }
 
@@ -16,7 +19,16 @@ function normalized(filePath: string): string {
   return filePath.replace(/\\/g, '/').replace(/^\.\//, '');
 }
 
+// A real receipt file: `.mythos/receipts/swd-*.json`. Used for counting and
+// integrity/chain verification.
 function isReceiptPath(filePath: string): boolean {
+  return /^\.mythos\/receipts\/swd-[^/]*\.json$/i.test(normalized(filePath));
+}
+
+// Any JSON under the receipts dir — receipts plus the chain-head pointer. These
+// are Mythos's own bookkeeping, never project files that need receipt coverage,
+// so they are excluded from the coverage set.
+function isReceiptArtifactPath(filePath: string): boolean {
   return /^\.mythos\/receipts\/.*\.json$/i.test(normalized(filePath));
 }
 
@@ -88,7 +100,7 @@ export function reviewChangedReceipts(cwd: string, changedFiles: ChangedFile[]):
   const changedNonReceiptFiles = changedFiles
     .filter((file) => file.status !== 'deleted')
     .map((file) => normalized(file.path))
-    .filter((filePath) => !isReceiptPath(filePath));
+    .filter((filePath) => !isReceiptArtifactPath(filePath));
   const uncoveredChangedFiles = receiptFiles.length === 0
     ? []
     : changedNonReceiptFiles.filter((filePath) => !coveredFiles.has(filePath));
@@ -104,12 +116,33 @@ export function reviewChangedReceipts(cwd: string, changedFiles: ChangedFile[]):
     });
   }
 
+  // Append-only chain verification. Only meaningful when receipts changed in
+  // this diff; verifies the full chain present in the checked-out tree so a
+  // deleted, reordered, or forged receipt is caught — not just an in-place edit.
+  let chain = { present: false, ok: true, length: 0 } as ReturnType<typeof verifyReceiptChain>;
+  if (receiptFiles.length > 0) {
+    chain = verifyReceiptChain(join(cwd, RECEIPTS_DIR));
+    if (chain.present && !chain.ok) {
+      findings.push({
+        id: 'mythos-receipt-chain-broken',
+        severity: 'high',
+        title: 'Mythos receipt chain is broken',
+        evidence: [chain.reason ?? 'The receipt hash chain failed verification.', `Break near seq ${chain.brokenAt ?? 'unknown'}`],
+        why: 'Receipts are an append-only, hash-chained audit trail. A broken chain means a receipt was deleted, reordered, forged, or edited after the fact — the audit trail can no longer be trusted as complete.',
+        recommendation: 'Investigate why the receipt chain changed. Restore the removed/edited receipt, or regenerate the chain from fresh Mythos runs if the history was rewritten intentionally.',
+      });
+    }
+  }
+
   return {
     checked: receiptFiles.length > 0,
     changedReceiptCount: receiptFiles.length,
     validReceiptCount,
     coveredChangedFileCount: changedNonReceiptFiles.length - uncoveredChangedFiles.length,
     uncoveredChangedFiles,
+    chainChecked: chain.present,
+    chainOk: chain.ok,
+    chainLength: chain.length,
     findings,
   };
 }

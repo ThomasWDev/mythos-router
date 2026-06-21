@@ -88,6 +88,10 @@ class ChatSession {
   // usage. Seeded with a rough default until enough real samples accumulate.
   private charsPerToken = DEFAULT_CHARS_PER_TOKEN;
   private tokenCalibrationSamples = 0;
+  // SWD verification tally across the session (real applies only, never dry-run).
+  private swdActionsVerified = 0;
+  private swdActionsFailed = 0;
+  private swdCorrectionTurns = 0;
 
   constructor(options: ChatOptions, ui: ChatUI) {
     this.options = options;
@@ -392,6 +396,16 @@ class ChatSession {
     }
   }
 
+  private recordVerificationOutcome(result: SWDRunResult): void {
+    // Real applies only — dry-run reports everything as "verified" without
+    // touching disk, which would inflate the tally with non-verifications.
+    if (this.options.dryRun) return;
+    for (const res of result.results) {
+      if (res.status === 'verified' || res.status === 'noop') this.swdActionsVerified++;
+      else this.swdActionsFailed++; // 'failed' | 'drift'
+    }
+  }
+
   private trackSuccessfulTouchedFiles(result: SWDRunResult): void {
     if (!result.success || result.rolledBack) return;
     const actions = result.results
@@ -441,6 +455,7 @@ class ChatSession {
     this.ui.startLoading('Verifying and applying changes...');
     const result = await this.engine.run(approvedActions);
     this.ui.stopLoading();
+    this.recordVerificationOutcome(result);
     printSWDResults(result);
 
     let finalResult = result;
@@ -554,6 +569,7 @@ class ChatSession {
 
   private async runCorrectionLoop(lastResult: SWDRunResult): Promise<SWDRunResult> {
     for (let attempt = 1; attempt <= MAX_CORRECTION_RETRIES; attempt++) {
+      this.swdCorrectionTurns++;
       const budgetCheck = this.budget.check();
       if (!budgetCheck.ok) {
         this.ui.warn('Correction aborted — budget exhausted.');
@@ -623,6 +639,7 @@ class ChatSession {
         this.ui.startLoading('Verifying corrected actions...');
         const result = await this.engine.run(approvedCorrectionActions);
         this.ui.stopLoading();
+        this.recordVerificationOutcome(result);
         printSWDResults(result);
 
         if (result.success) {
@@ -734,6 +751,7 @@ class ChatSession {
     this.ui.startLoading('Applying test fixes...');
     const fixResult = await this.engine.run(approvedTestFixActions);
     this.ui.stopLoading();
+    this.recordVerificationOutcome(fixResult);
     printSWDResults(fixResult);
 
     if (!fixResult.success) {
@@ -818,6 +836,7 @@ class ChatSession {
 
     const snap = this.budget.status();
     if (snap.totalTokens > 0) {
+      const swdTotal = this.swdActionsVerified + this.swdActionsFailed + this.swdCorrectionTurns;
       saveSessionMetric({
         command,
         project: path.basename(process.cwd()),
@@ -827,6 +846,15 @@ class ChatSession {
         costUSD: snap.estimatedCostUSD,
         durationMs: snap.elapsedMs,
         timestamp: new Date().toISOString(),
+        ...(swdTotal > 0
+          ? {
+              swd: {
+                actionsVerified: this.swdActionsVerified,
+                actionsFailed: this.swdActionsFailed,
+                correctionTurns: this.swdCorrectionTurns,
+              },
+            }
+          : {}),
       });
     }
 

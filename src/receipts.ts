@@ -168,10 +168,54 @@ export interface SWDReceipt {
     commit?: string;
   };
   test?: ReceiptTestResult;
+  /**
+   * Append-only hash-chain linkage. `seq` is the receipt's position in the
+   * chain (genesis = 0); `prevHash` is the integrity hash of the receipt at
+   * `seq - 1` (empty string for genesis). Both fields are part of the hashed
+   * payload, so editing either one breaks `integrity.sha256` — which is what
+   * makes deletion, reordering, and forgery detectable rather than just
+   * in-place edits.
+   */
+  chain?: ReceiptChain;
   integrity?: {
     sha256: string;
   };
 }
+
+export interface ReceiptChain {
+  seq: number;
+  prevHash: string;
+}
+
+/** Pointer to the chain tip, stored alongside receipts so a deleted/replaced
+ *  latest receipt is also detectable. Not itself a receipt. */
+export interface ChainHead {
+  id: string;
+  seq: number;
+  hash: string;
+  updatedAt: string;
+}
+
+export interface ChainVerification {
+  /** True when at least one chained receipt exists on disk. */
+  present: boolean;
+  /** True when the chain is intact (no edits, gaps, or broken links). */
+  ok: boolean;
+  /** Number of chained receipts inspected. */
+  length: number;
+  /** seq at which a break was detected, if any. */
+  brokenAt?: number;
+  /** Human-readable explanation of the break, if any. */
+  reason?: string;
+  /** Whether the HEAD pointer matches the latest receipt (undefined if no HEAD). */
+  headMatches?: boolean;
+}
+
+/** prevHash value for the genesis receipt (seq 0). */
+export const GENESIS_PREV_HASH = '';
+
+/** Filename of the chain-tip pointer inside the receipts dir. */
+export const CHAIN_HEAD_FILE = 'chain-head.json';
 
 type SnapshotLike = {
   path: string;
@@ -391,17 +435,49 @@ export function saveSWDReceipt(receipt: SWDReceipt, overwrite = true): string {
   const rootDir = getCurrentRoot();
   const dir = ensureReceiptsDir();
   const filePath = path.join(dir, `${receipt.id}.json`);
+  const alreadyExists = existsSync(filePath);
 
-  if (!overwrite && existsSync(filePath)) {
+  if (!overwrite && alreadyExists) {
     return filePath;
   }
 
-  const normalized = withIntegrity({
+  // Determine chain linkage.
+  //  - New receipt: link it to the current tip (genesis if none) and advance HEAD.
+  //  - Re-save of an existing receipt: preserve its stored chain and leave HEAD
+  //    alone, so an idempotent rewrite never re-sequences or relinks the chain.
+  let chain = receipt.chain;
+  let advanceHead = false;
+  if (alreadyExists) {
+    const stored = readReceiptFile(filePath);
+    chain = stored?.chain ?? receipt.chain;
+  } else if (!chain) {
+    const head = readChainHead(dir);
+    chain = {
+      seq: head ? head.seq + 1 : 0,
+      prevHash: head ? head.hash : GENESIS_PREV_HASH,
+    };
+    advanceHead = true;
+  }
+
+  const payload: Omit<SWDReceipt, 'integrity'> = {
     ...receiptPayload(receipt),
     files: receipt.files.map((file) => normalizeStoredFile(rootDir, file)),
     skills: receipt.skills?.map((skill) => normalizeReceiptSkill(rootDir, skill)),
-  });
+  };
+  if (chain) payload.chain = chain;
+
+  const normalized = withIntegrity(payload);
   writeFileSync(filePath, `${JSON.stringify(normalized, null, 2)}\n`, 'utf-8');
+
+  if (advanceHead && chain && normalized.integrity) {
+    writeChainHead(dir, {
+      id: normalized.id,
+      seq: chain.seq,
+      hash: normalized.integrity.sha256,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
   return filePath;
 }
 
@@ -424,14 +500,41 @@ function normalizeStoredSnapshot(rootDir: string, snapshot?: ReceiptSnapshot): R
   };
 }
 
-function receiptFiles(): string[] {
-  const dir = getReceiptsDir();
+function receiptFilesIn(dir: string): string[] {
   if (!existsSync(dir)) return [];
 
   return readdirSync(dir)
-    .filter((entry) => entry.endsWith('.json'))
+    // Receipt ids are always `swd-<stamp>-<digest>`, so this naturally excludes
+    // the chain-head pointer and any other JSON that isn't a receipt.
+    .filter((entry) => entry.startsWith('swd-') && entry.endsWith('.json'))
     .map((entry) => path.join(dir, entry))
     .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+}
+
+function receiptFiles(): string[] {
+  return receiptFilesIn(getReceiptsDir());
+}
+
+function chainHeadPath(dir: string): string {
+  return path.join(dir, CHAIN_HEAD_FILE);
+}
+
+function readChainHead(dir: string): ChainHead | null {
+  const filePath = chainHeadPath(dir);
+  if (!existsSync(filePath)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as ChainHead;
+    if (typeof parsed?.seq === 'number' && typeof parsed?.hash === 'string' && typeof parsed?.id === 'string') {
+      return parsed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function writeChainHead(dir: string, head: ChainHead): void {
+  writeFileSync(chainHeadPath(dir), `${JSON.stringify(head, null, 2)}\n`, 'utf-8');
 }
 
 function readReceiptFile(filePath: string): SWDReceipt | null {
@@ -596,6 +699,89 @@ export function verifyReceipt(receipt: SWDReceipt): ReceiptVerification {
 
 export function verifyReceiptIntegrity(receipt: SWDReceipt): boolean {
   return receipt.integrity?.sha256 === integrityHash(receipt);
+}
+
+/**
+ * Verify the append-only receipt chain in `dir`.
+ *
+ * Per-receipt `integrity.sha256` (which now covers the `chain` fields) catches
+ * in-place edits. On top of that, the chain catches the things a self-hash
+ * cannot:
+ *   - **deletion / insertion** → a gap in the contiguous `seq` run;
+ *   - **reordering / forgery**  → a `prevHash` that doesn't match the previous
+ *     receipt's integrity hash;
+ *   - **tip replacement**       → a HEAD pointer that doesn't match the latest
+ *     receipt.
+ *
+ * Receipts written before chaining was introduced have no `chain` field and are
+ * ignored, so upgrading an existing repo simply starts a fresh chain rather than
+ * reporting every legacy receipt as broken.
+ */
+export function verifyReceiptChain(dir = getReceiptsDir()): ChainVerification {
+  const chained = receiptFilesIn(dir)
+    .map((filePath) => readReceiptFile(filePath))
+    .filter((receipt): receipt is SWDReceipt => receipt !== null)
+    .filter((receipt) => receipt.chain !== undefined)
+    .sort((a, b) => a.chain!.seq - b.chain!.seq);
+
+  if (chained.length === 0) {
+    return { present: false, ok: true, length: 0 };
+  }
+
+  const broken = (brokenAt: number, reason: string, headMatches?: boolean): ChainVerification => ({
+    present: true,
+    ok: false,
+    length: chained.length,
+    brokenAt,
+    reason,
+    headMatches,
+  });
+
+  // The chain must begin at genesis; a non-zero first seq means the earliest
+  // receipts were removed.
+  const first = chained[0].chain!;
+  if (first.seq !== 0) {
+    return broken(0, `The earliest receipts are missing — the chain starts at seq ${first.seq} instead of genesis (seq 0).`);
+  }
+  if (first.prevHash !== GENESIS_PREV_HASH) {
+    return broken(0, 'The genesis receipt has a non-empty prevHash, so it was not the true start of the chain.');
+  }
+
+  let prevHash: string | null = null;
+  let expectedSeq = 0;
+  for (const receipt of chained) {
+    const seq = receipt.chain!.seq;
+
+    if (!verifyReceiptIntegrity(receipt)) {
+      return broken(seq, `Receipt ${receipt.id} (seq ${seq}) was edited after creation — its integrity hash no longer matches.`);
+    }
+    if (seq !== expectedSeq) {
+      return broken(expectedSeq, `Chain gap at seq ${expectedSeq}: a receipt was deleted, reordered, or inserted.`);
+    }
+    if (prevHash !== null && receipt.chain!.prevHash !== prevHash) {
+      return broken(seq, `Broken link at seq ${seq}: prevHash does not match the previous receipt's hash.`);
+    }
+
+    prevHash = receipt.integrity!.sha256;
+    expectedSeq++;
+  }
+
+  const head = readChainHead(dir);
+  const tip = chained[chained.length - 1];
+  const headMatches = head !== null
+    && head.id === tip.id
+    && head.seq === tip.chain!.seq
+    && head.hash === tip.integrity!.sha256;
+
+  if (head !== null && !headMatches) {
+    return broken(
+      tip.chain!.seq,
+      'The chain HEAD pointer does not match the latest receipt — the most recent receipt may have been deleted or replaced.',
+      headMatches,
+    );
+  }
+
+  return { present: true, ok: true, length: chained.length, headMatches };
 }
 
 export const createReceipt = createSWDReceipt;

@@ -22,16 +22,24 @@ export {
   type ProviderCapability,
   type ProviderStatus,
   type OrchestrationEvent,
+  ProviderError,
+  isRetryableKind,
+  kindFromStatus,
+  type ProviderErrorKind,
+  type ProviderErrorOptions,
 } from './providers/types.js';
+export { isRetryableError } from './providers/orchestrator.js';
 
 // Export the Strict Write Discipline Engine (v1 API — Pure Kernel)
 export {
   SWDEngine,
   parseActions,
+  actionsFromToolCalls,
   snapshotFile,
   resolveSafePath,
   summarizeActions,
   type FileAction,
+  type ToolCallFileAction,
   type ActionIntent,
   type ActionResult,
   type VerificationStatus,
@@ -167,6 +175,7 @@ export {
   readReceipts,
   verifyReceipt,
   verifyReceiptIntegrity,
+  verifyReceiptChain,
   getReceiptsDir,
   type SWDReceipt,
   type SWDReceiptInput,
@@ -181,6 +190,9 @@ export {
   type ReceiptSnapshot,
   type ReceiptVerification,
   type ReceiptFileVerification,
+  type ReceiptChain,
+  type ChainHead,
+  type ChainVerification,
 } from './receipts.js';
 export { formatReceiptMarkdown } from './receipt-markdown.js';
 export {

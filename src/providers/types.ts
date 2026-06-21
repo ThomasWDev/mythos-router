@@ -118,3 +118,62 @@ export interface OrchestrationEvent {
   cost: number;
   retryCount: number;
 }
+
+// ── Structured Provider Errors ───────────────────────────────
+// A typed error so retry/circuit-breaker decisions key off an explicit `kind`
+// instead of scanning the message string (where a byte count or request id can
+// masquerade as a status code). Providers throw these; the orchestrator reads
+// `.retryable` / `.kind` directly and only falls back to heuristics for raw
+// SDK/network errors that aren't ProviderError instances.
+export type ProviderErrorKind =
+  | 'rate_limit'    // HTTP 429
+  | 'overloaded'    // provider-signalled overload (e.g. Anthropic 529)
+  | 'server_error'  // HTTP 5xx
+  | 'network'       // connection refused/reset, DNS, fetch failed
+  | 'timeout'       // request/watchdog timeout
+  | 'client_error'  // HTTP 4xx (non-retryable)
+  | 'unknown';
+
+export function isRetryableKind(kind: ProviderErrorKind): boolean {
+  return kind === 'rate_limit'
+    || kind === 'overloaded'
+    || kind === 'server_error'
+    || kind === 'network'
+    || kind === 'timeout';
+}
+
+export interface ProviderErrorOptions {
+  kind: ProviderErrorKind;
+  status?: number;
+  providerId?: string;
+  retryable?: boolean;
+  cause?: unknown;
+}
+
+export class ProviderError extends Error {
+  readonly kind: ProviderErrorKind;
+  readonly status?: number;
+  readonly providerId?: string;
+  readonly retryable: boolean;
+
+  constructor(message: string, options: ProviderErrorOptions) {
+    super(message);
+    this.name = 'ProviderError';
+    this.kind = options.kind;
+    this.status = options.status;
+    this.providerId = options.providerId;
+    this.retryable = options.retryable ?? isRetryableKind(options.kind);
+    if (options.cause !== undefined) {
+      (this as { cause?: unknown }).cause = options.cause;
+    }
+  }
+}
+
+/** Classify an HTTP status code into a ProviderErrorKind. */
+export function kindFromStatus(status: number): ProviderErrorKind {
+  if (status === 429) return 'rate_limit';
+  if (status === 529) return 'overloaded';
+  if (status >= 500) return 'server_error';
+  if (status >= 400) return 'client_error';
+  return 'unknown';
+}

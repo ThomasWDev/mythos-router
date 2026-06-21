@@ -11,6 +11,19 @@ export interface SessionMetric {
   costUSD: number;
   durationMs: number;
   timestamp: string;
+  /**
+   * SWD verification tally for sessions that ran file actions (chat/run only;
+   * absent for dry-runs and non-SWD commands). `actionsFailed` counts claims
+   * whose on-disk result did not match what the model asserted — the headline
+   * "how often did the agent misreport a write" number.
+   */
+  swd?: SessionSWDMetric;
+}
+
+export interface SessionSWDMetric {
+  actionsVerified: number;   // verified + noop
+  actionsFailed: number;     // failed + drift (claim did not match the filesystem)
+  correctionTurns: number;   // correction turns triggered to recover
 }
 
 const METRICS_DIR = path.join(os.homedir(), '.mythos-router');
