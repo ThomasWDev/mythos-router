@@ -3,6 +3,8 @@ import * as path from 'node:path';
 import { readFileSync } from 'node:fs';
 import { formatTokenUsage, getOrchestrator, type Message } from '../client.js';
 import { SWDEngine, parseActions, summarizeActions, snapshotFile, resolveSafePath, type SWDRunResult, type FileAction } from '../swd.js';
+import { FILE_ACTION_TOOL, toolCallsToActions } from '../providers/tools.js';
+import type { UnifiedResponse } from '../providers/types.js';
 import { printSWDResults, dryRunSWD, printVerboseParse } from '../swd-cli.js';
 import { saveSessionMetric } from '../metrics.js';
 import { appendEntry, appendMetadataBlock, needsDream, getMemoryContext, printMemoryStatus, getEntryCount } from '../memory.js';
@@ -92,10 +94,13 @@ class ChatSession {
   private swdActionsVerified = 0;
   private swdActionsFailed = 0;
   private swdCorrectionTurns = 0;
+  // Opt-in native tool-calling (see --tools). Falls back to text parsing.
+  public useNativeTools = false;
 
   constructor(options: ChatOptions, ui: ChatUI) {
     this.options = options;
     this.ui = ui;
+    this.useNativeTools = options.tools === true;
     this.escalation = parseEscalationConfig(options);
     // Parse budget config
     const baseMaxTokens = parseInt(options.maxTokens ?? '500000', 10) || 500_000;
@@ -279,6 +284,7 @@ class ChatSession {
           systemPrompt: this.finalSystemPrompt || '',
           effort: this.options.effort as EffortLevel,
           maxTokens: this.maxOutputTokens,
+          tools: this.toolsForRequest(),
           deterministic: !!this.forceProvider,
           forceProvider: this.forceProvider,
           allowFallback: this.allowFallback,
@@ -312,7 +318,7 @@ class ChatSession {
 
       if (this.options.verbose) printVerboseParse(response.text);
 
-      const handled = await this.handleSWD(response.text, input, {
+      const handled = await this.handleSWD(response, input, {
         provider: {
           providerId: response.metadata.providerId,
           modelId: response.metadata.modelId,
@@ -396,6 +402,24 @@ class ChatSession {
     }
   }
 
+  // When native tool-calling is enabled, offer the write_files tool to the
+  // provider. Returns undefined otherwise so requests are unchanged by default.
+  private toolsForRequest() {
+    return this.useNativeTools ? [FILE_ACTION_TOOL] : undefined;
+  }
+
+  // Single seam from a model response to FileActions. With native tools on and
+  // tool calls present, use them; otherwise fall back to parsing text
+  // FILE_ACTION blocks. This makes tool mode strictly additive — a model that
+  // ignores the tool and emits text still works.
+  private extractActions(response: UnifiedResponse): FileAction[] {
+    if (this.useNativeTools && response.toolCalls && response.toolCalls.length > 0) {
+      const fromTools = toolCallsToActions(response.toolCalls);
+      if (fromTools.length > 0) return fromTools;
+    }
+    return parseActions(response.text);
+  }
+
   private recordVerificationOutcome(result: SWDRunResult): void {
     // Real applies only — dry-run reports everything as "verified" without
     // touching disk, which would inflate the tally with non-verifications.
@@ -427,8 +451,9 @@ class ChatSession {
     return true;
   }
 
-  private async handleSWD(responseText: string, userInput: string, receiptContext: ReceiptContext): Promise<boolean> {
-    const actions = parseActions(responseText);
+  private async handleSWD(response: UnifiedResponse, userInput: string, receiptContext: ReceiptContext): Promise<boolean> {
+    const responseText = response.text;
+    const actions = this.extractActions(response);
     warnIfMalformedFileActionOutput(responseText, actions.length, this.ui);
     if (actions.length === 0) {
       const commandLabel = this.options.mode ?? 'chat';
@@ -628,7 +653,7 @@ class ChatSession {
         this.history.push({ role: 'assistant', content: response.text });
         this.budget.record(response.usage.inputTokens, response.usage.outputTokens, response.metadata.modelId, response.metadata.providerId);
 
-        const correctionActions = parseActions(response.text);
+        const correctionActions = this.extractActions(response);
         warnIfMalformedFileActionOutput(response.text, correctionActions.length, this.ui);
         const approvedCorrectionActions = await this.approveActions(correctionActions, 'SWD correction security review');
         if (approvedCorrectionActions.length === 0) {

@@ -24,6 +24,15 @@ export interface UnifiedToolCall {
   args: Record<string, unknown>;
 }
 
+// ── Tool Definition (provider-neutral) ───────────────────────
+// A tool the model may call. `inputSchema` is a JSON Schema object. Each
+// provider adapter maps this onto its own native tool format.
+export interface ToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
 // ── Unified Response ─────────────────────────────────────────
 // The final output of any provider call, whether streamed or not.
 // Invariant: Must perfectly match concatenated streamed chunks.
@@ -52,6 +61,11 @@ export interface RequestOptions {
   allowFallback?: boolean;
   timeoutMs?: number;
   signal?: AbortSignal;
+  // Optional native tool-calling. When provided, a provider that supports tools
+  // will offer them to the model and populate UnifiedResponse.toolCalls. Leave
+  // unset to use the text-based FILE_ACTION protocol (the default).
+  tools?: ToolDefinition[];
+  toolChoice?: 'auto' | 'required' | { name: string };
 }
 
 // ── Stream Options (extends Request with callbacks) ──────────
@@ -71,11 +85,12 @@ export interface SendOptions extends RequestOptions {
 }
 
 // ── Provider Capabilities ────────────────────────────────────
-// Descriptive metadata only: documents what a backend supports. Native
-// tool-calling is intentionally not modeled here — Mythos routes file
-// operations through the text-based FILE_ACTION protocol (see swd.ts), which
-// is provider-agnostic and verified against the filesystem.
-export type ProviderCapability = 'thinking' | 'streaming';
+// Descriptive metadata: documents what a backend supports. The default file
+// path is still the provider-agnostic text FILE_ACTION protocol (see swd.ts);
+// 'tools' additionally advertises native tool-calling, an opt-in path that
+// emits the same FILE_ACTION envelope as structured tool input and is verified
+// against the filesystem the same way.
+export type ProviderCapability = 'thinking' | 'streaming' | 'tools';
 
 // ── Provider Health Status ───────────────────────────────────
 export type ProviderStatus = 'healthy' | 'degraded' | 'down';

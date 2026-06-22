@@ -14,7 +14,9 @@ import {
   type SendOptions,
   type UnifiedResponse,
   type ProviderCapability,
+  type RequestOptions,
 } from './types.js';
+import { toAnthropicTool, extractAnthropicToolCalls } from './tools.js';
 import { MODELS, CAPYBARA_SYSTEM_PROMPT } from '../config.js';
 
 // ── SDK delta types (not exported by Anthropic SDK) ──────────
@@ -36,12 +38,27 @@ export class AnthropicProvider implements BaseProvider {
   readonly capabilities: ReadonlySet<ProviderCapability> = new Set([
     'thinking',
     'streaming',
+    'tools',
   ]);
 
   private client: Anthropic;
 
   constructor(apiKey: string) {
     this.client = new Anthropic({ apiKey });
+  }
+
+  // ── Build the optional tools request fragment ────────────
+  // Returns {} unless the caller passed tools, so default (text FILE_ACTION)
+  // requests are byte-for-byte unchanged.
+  private toolRequest(options: RequestOptions): Record<string, unknown> {
+    if (!options.tools || options.tools.length === 0) return {};
+    const tools = options.tools.map(toAnthropicTool);
+    const tc = options.toolChoice;
+    let tool_choice: Record<string, unknown> | undefined;
+    if (tc === 'required') tool_choice = { type: 'any' };
+    else if (tc && typeof tc === 'object') tool_choice = { type: 'tool', name: tc.name };
+    else if (tc === 'auto') tool_choice = { type: 'auto' };
+    return tool_choice ? { tools, tool_choice } : { tools };
   }
 
   // ── Input Validation ─────────────────────────────────────
@@ -114,6 +131,7 @@ export class AnthropicProvider implements BaseProvider {
         model,
         max_tokens: maxTokens,
         ...(thinking ? { thinking } : {}),
+        ...this.toolRequest(options),
         system: systemPrompt,
         messages: apiMessages,
       }, { signal: options.signal });
@@ -166,11 +184,12 @@ export class AnthropicProvider implements BaseProvider {
     const finalMessage = await stream.finalMessage();
     inputTokens = finalMessage.usage?.input_tokens ?? 0;
     outputTokens = finalMessage.usage?.output_tokens ?? 0;
+    const toolCalls = extractAnthropicToolCalls(finalMessage.content as never);
 
     return {
       thinking: thinkingText,
       text: responseText,
-      toolCalls: [],
+      toolCalls,
       usage: {
         inputTokens,
         outputTokens,
@@ -180,8 +199,11 @@ export class AnthropicProvider implements BaseProvider {
         providerId: this.id,
         modelId: model,
         fallbackTriggered: false,
-        // No text and no reasoning is an unusable success; flag for fallback.
-        incomplete: responseText.trim().length === 0 && thinkingText.trim().length === 0,
+        // No text, no reasoning, and no tool call is an unusable success.
+        incomplete:
+          responseText.trim().length === 0 &&
+          thinkingText.trim().length === 0 &&
+          toolCalls.length === 0,
       },
     };
   }
@@ -206,6 +228,7 @@ export class AnthropicProvider implements BaseProvider {
         model,
         max_tokens: maxTokens,
         ...(thinking ? { thinking } : {}),
+        ...this.toolRequest(options),
         system: systemPrompt,
         messages: apiMessages,
       }, { signal: options.signal });
@@ -223,11 +246,12 @@ export class AnthropicProvider implements BaseProvider {
         responseText += block.text;
       }
     }
+    const toolCalls = extractAnthropicToolCalls(response.content as never);
 
     return {
       thinking: thinkingText,
       text: responseText,
-      toolCalls: [],
+      toolCalls,
       usage: {
         inputTokens: response.usage?.input_tokens ?? 0,
         outputTokens: response.usage?.output_tokens ?? 0,
@@ -237,7 +261,10 @@ export class AnthropicProvider implements BaseProvider {
         providerId: this.id,
         modelId: model,
         fallbackTriggered: false,
-        incomplete: responseText.trim().length === 0 && thinkingText.trim().length === 0,
+        incomplete:
+          responseText.trim().length === 0 &&
+          thinkingText.trim().length === 0 &&
+          toolCalls.length === 0,
       },
     };
   }

@@ -27,8 +27,18 @@ export {
   kindFromStatus,
   type ProviderErrorKind,
   type ProviderErrorOptions,
+  type ToolDefinition,
 } from './providers/types.js';
 export { isRetryableError } from './providers/orchestrator.js';
+export {
+  FILE_ACTION_TOOL,
+  FILE_ACTION_TOOL_NAME,
+  toolCallsToActions,
+  toAnthropicTool,
+  toOpenAITool,
+  extractAnthropicToolCalls,
+  extractOpenAIToolCalls,
+} from './providers/tools.js';
 
 // Export the Strict Write Discipline Engine (v1 API — Pure Kernel)
 export {

@@ -27,6 +27,9 @@ export interface ChatOptions {
   resume?: boolean;
   escalate?: boolean;
   escalateTo?: string;
+  // Opt-in (--tools): route file operations through native provider
+  // tool-calling instead of text FILE_ACTION blocks (auto-falls back to text).
+  tools?: boolean;
 }
 
 export interface RunOptions extends Omit<ChatOptions, 'mode' | 'resume'> {

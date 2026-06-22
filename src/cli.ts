@@ -141,6 +141,10 @@ program
     '--escalate-to <level>',
     'Ceiling tier for --escalate: high (default), medium, low',
   )
+  .option(
+    '--tools',
+    'Use native provider tool-calling for file operations instead of text FILE_ACTION blocks (Anthropic/OpenAI; auto-falls back to text)',
+  )
   .action(chatCommand);
 
 // mythos run
@@ -218,6 +222,10 @@ program
   .option(
     '--escalate-to <level>',
     'Ceiling tier for --escalate: high (default), medium, low',
+  )
+  .option(
+    '--tools',
+    'Use native provider tool-calling for file operations instead of text FILE_ACTION blocks (Anthropic/OpenAI; auto-falls back to text)',
   )
   .action((prompt: string[] | undefined, options: Parameters<typeof runCommand>[1]) => runCommand((prompt ?? []).join(' '), options));
 

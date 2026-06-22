@@ -55,7 +55,7 @@ Zero slop. Zero hallucinated state. Every write verified.
 |  **Self-Improving Skills** | `mythos skills suggest` mines past SWD receipts for file actions that keep failing verification and proposes `SKILL.md` rules to prevent them; read-only by default, `--write` to persist |
 |  **Deterministic Caching** | SQLite-backed caching for reasoning (SDK only) *(Node 22+)* |
 |  **Adaptive Thinking** | Opus 4.8 with configurable effort levels (high/medium/low) |
-|  **Strict Write Discipline** | Pre/post filesystem snapshots verify every model or external-agent file claim |
+|  **Strict Write Discipline** | Pre/post filesystem snapshots verify every model or external-agent file claim. Works over text `FILE_ACTION` blocks by default, or native provider tool-calling with `--tools` (Anthropic/OpenAI) — same verification either way, auto-falls back to text |
 |  **Isolated Runs** | `swd apply --check <cmd>` / `--run-checks` test a batch in a throwaway copy and apply it to the real tree only if checks pass — the real tree is never left broken |
 |  **SWD Receipts** | Per-run trust receipts record touched files, hashes, provider/external-agent id, budget, git state, and verification result. Receipts are **hash-chained** (append-only): each links to the previous one, so deletion, reordering, or forgery is detectable — not just in-place edits |
 |  **Receipt Undo** | `receipts undo <id\|latest>` replays a verified receipt in reverse — previews by default, `--yes` to apply, drift-gated so it never overwrites newer edits, and produces its own receipt |
@@ -143,7 +143,7 @@ Small, runnable examples are available in [`examples/`](examples/):
 | [`external-agent-json`](examples/external-agent-json/) | Submit structured file actions through `mythos swd apply` without a Mythos model key |
 | [`mcp-stdio`](examples/mcp-stdio/) | Configure an MCP client to launch `mythos mcp` over local stdio |
 | [`project-policy`](examples/project-policy/) | Add enforced repo-local SWD block/confirm rules with `.mythos/policy.json` |
-| [`github-action`](examples/github-action/) | Run read-only `mythos verify --ci` in pull requests |
+| [`github-action`](examples/github-action/) | Add a read-only `verify --ci` PR gate — one-line reusable action (`uses: thewaltero/mythos-router@v1`) or copy-a-workflow |
 
 ### From Source
 

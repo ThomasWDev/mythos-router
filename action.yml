@@ -1,0 +1,50 @@
+name: 'Mythos Verify'
+description: 'Read-only SWD verification gate for pull requests — flags risky changes and checks receipt integrity + the append-only receipt chain. No API key required.'
+author: 'thewaltero'
+
+branding:
+  icon: 'shield'
+  color: 'purple'
+
+inputs:
+  strict:
+    description: 'Fail on warnings as well as high-severity findings.'
+    required: false
+    default: 'false'
+  working-directory:
+    description: 'Directory to run the verification in.'
+    required: false
+    default: '.'
+  version:
+    description: 'Version of mythos-router to run via npx (e.g. "latest", "1.21.0").'
+    required: false
+    default: 'latest'
+  base:
+    description: 'Base ref to diff against. Defaults to the GitHub base ref or HEAD~1.'
+    required: false
+    default: ''
+  json:
+    description: 'Also print machine-readable JSON output.'
+    required: false
+    default: 'false'
+  node-version:
+    description: 'Node.js version to set up.'
+    required: false
+    default: '22'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Run mythos verify --ci
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        npx -y mythos-router@${{ inputs.version }} verify --ci \
+          ${{ inputs.strict == 'true' && '--strict' || '' }} \
+          ${{ inputs.json == 'true' && '--json' || '' }} \
+          ${{ inputs.base != '' && format('--base {0}', inputs.base) || '' }}

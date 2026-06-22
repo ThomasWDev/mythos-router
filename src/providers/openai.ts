@@ -5,9 +5,16 @@ import {
   type SendOptions,
   type UnifiedResponse,
   type ProviderCapability,
+  type UnifiedToolCall,
   ProviderError,
   kindFromStatus,
 } from './types.js';
+import {
+  toOpenAITool,
+  toOpenAIToolChoice,
+  extractOpenAIToolCalls,
+  OpenAIToolCallAccumulator,
+} from './tools.js';
 
 // ── Provider Configuration ───────────────────────────────────
 export interface OpenAIProviderConfig {
@@ -70,7 +77,7 @@ export class OpenAIProvider implements BaseProvider {
     this.reasoningModel = config.reasoningModel ?? detectReasoningModel(config.defaultModel);
     this.includeUsage = config.includeUsageStreamOption ?? true;
 
-    const caps: ProviderCapability[] = ['streaming'];
+    const caps: ProviderCapability[] = ['streaming', 'tools'];
     if (this.supportsThinking) caps.push('thinking');
     this.capabilities = new Set(caps);
   }
@@ -119,6 +126,14 @@ export class OpenAIProvider implements BaseProvider {
       }
     }
 
+    // Native tool-calling (opt-in). Omitted entirely unless the caller passes
+    // tools, so default requests are unchanged.
+    if (options.tools && options.tools.length > 0) {
+      body.tools = options.tools.map(toOpenAITool);
+      const choice = toOpenAIToolChoice(options.toolChoice);
+      if (choice !== undefined) body.tool_choice = choice;
+    }
+
     return body;
   }
 
@@ -132,6 +147,7 @@ export class OpenAIProvider implements BaseProvider {
     let responseText = '';
     let inputTokens = 0;
     let outputTokens = 0;
+    const toolAcc = new OpenAIToolCallAccumulator();
 
     try {
       while (true) {
@@ -149,7 +165,11 @@ export class OpenAIProvider implements BaseProvider {
           if (!parsed) continue;
 
           const choices = parsed.choices as Array<{
-            delta?: { content?: string; reasoning_content?: string; };
+            delta?: {
+              content?: string;
+              reasoning_content?: string;
+              tool_calls?: Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string } }>;
+            };
           }> | undefined;
 
           if (choices?.[0]?.delta) {
@@ -161,6 +181,9 @@ export class OpenAIProvider implements BaseProvider {
             if (delta.content) {
               responseText += delta.content;
               options.onTextDelta?.(delta.content);
+            }
+            if (delta.tool_calls) {
+              toolAcc.add(delta.tool_calls);
             }
           }
 
@@ -175,7 +198,7 @@ export class OpenAIProvider implements BaseProvider {
       reader.releaseLock();
     }
 
-    return { thinkingText, responseText, inputTokens, outputTokens };
+    return { thinkingText, responseText, inputTokens, outputTokens, toolCalls: toolAcc.finalize() };
   }
 
   // ── Streaming Message ────────────────────────────────────
@@ -210,7 +233,7 @@ export class OpenAIProvider implements BaseProvider {
       throw new Error(`[${this.id}] No response body received`);
     }
 
-    const { thinkingText, responseText, inputTokens: parsedInputTokens, outputTokens: parsedOutputTokens } =
+    const { thinkingText, responseText, inputTokens: parsedInputTokens, outputTokens: parsedOutputTokens, toolCalls } =
       await this.processSSEStream(response.body.getReader(), options);
 
     let inputTokens = parsedInputTokens;
@@ -226,15 +249,15 @@ export class OpenAIProvider implements BaseProvider {
       outputTokens = Math.ceil((responseText.length + thinkingText.length) / 4);
     }
 
-    // A response with no text and no reasoning is not a usable success; flag it
-    // incomplete so the orchestrator falls back instead of returning emptiness.
+    // A response with no text, no reasoning, and no tool call is not a usable
+    // success; flag it incomplete so the orchestrator falls back.
     const aborted = !!options.signal?.aborted;
-    const empty = responseText.trim().length === 0 && thinkingText.trim().length === 0;
+    const empty = responseText.trim().length === 0 && thinkingText.trim().length === 0 && toolCalls.length === 0;
 
     return {
       thinking: thinkingText,
       text: responseText,
-      toolCalls: [],
+      toolCalls,
       usage: {
         inputTokens,
         outputTokens,
@@ -282,6 +305,7 @@ export class OpenAIProvider implements BaseProvider {
         message?: {
           content?: string;
           reasoning_content?: string;
+          tool_calls?: Array<{ id?: string; type?: string; function?: { name?: string; arguments?: string } }>;
         };
       }>;
       usage?: {
@@ -293,6 +317,7 @@ export class OpenAIProvider implements BaseProvider {
     const choice = data.choices?.[0]?.message;
     const thinkingText = choice?.reasoning_content ?? '';
     const responseText = choice?.content ?? '';
+    const toolCalls: UnifiedToolCall[] = extractOpenAIToolCalls(choice);
     const inputTokens = data.usage?.prompt_tokens ?? Math.ceil(
       messages.reduce((acc, m) => acc + m.content.length, 0) / 4
     );
@@ -303,7 +328,7 @@ export class OpenAIProvider implements BaseProvider {
     return {
       thinking: thinkingText,
       text: responseText,
-      toolCalls: [],
+      toolCalls,
       usage: {
         inputTokens,
         outputTokens,
