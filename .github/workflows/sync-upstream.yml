@@ -1,0 +1,29 @@
+name: Sync fork from upstream
+
+on:
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Merge thewaltero/mythos-router main → this fork
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream main
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/thewaltero/mythos-router.git
+          git fetch upstream main
+          git checkout main
+          git merge upstream/main --no-edit
+
+      - name: Push to fork main
+        run: git push origin main
