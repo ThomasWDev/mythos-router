@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.22.1] - 2026-07-03
+
+### Fixed
+
+- Aligned sandbox SWD preflight semantics with the real SWD engine.
+- Centralized SWD path safety validation across action parsing and apply paths.
+- Allowed safe filenames containing `..` while still blocking real path traversal.
+- Stream-hashed large file snapshots to avoid loading oversized files into memory.
+- Added regression coverage for sandbox apply semantics, path validation, and large-file snapshot behavior.
+
 ## [1.21.0] - 2026-06-21
 
 ### Added
@@ -513,6 +523,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Correction Turns** — max 2 retries before yielding to human.
 - **Dream/Verify Commands** — memory compression and drift detection.
 
+[1.22.1]: https://github.com/thewaltero/mythos-router/releases/tag/v1.22.1
 [1.21.0]: https://github.com/thewaltero/mythos-router/releases/tag/v1.21.0
 [1.20.0]: https://github.com/thewaltero/mythos-router/releases/tag/v1.20.0
 [1.18.1]: https://github.com/thewaltero/mythos-router/releases/tag/v1.18.1
