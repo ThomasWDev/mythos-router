@@ -2,11 +2,17 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://mythos-router.local/schemas/external-agent-actions.schema.json",
   "title": "Mythos external-agent action envelope",
-  "description": "Input accepted by `mythos swd apply` / `mythos swd validate` and the MCP swd_* tools. Three shapes are accepted: (1) an object with an `actions` array, (2) an object carrying raw FILE_ACTION text in `output` or `text`, or (3) a bare array of action objects.",
+  "description": "Input accepted by `mythos swd apply` / `mythos swd validate` and the MCP swd_* tools. Three shapes are accepted: (1) an object with an `actions` array, (2) an object carrying raw FILE_ACTION text in `output` or `text`, or (3) a bare array of action objects. JSON operation and intent values are uppercase and case-sensitive.",
   "oneOf": [
-    { "$ref": "#/$defs/actionsEnvelope" },
-    { "$ref": "#/$defs/textEnvelope" },
-    { "$ref": "#/$defs/actionArray" }
+    {
+      "$ref": "#/$defs/actionsEnvelope"
+    },
+    {
+      "$ref": "#/$defs/textEnvelope"
+    },
+    {
+      "$ref": "#/$defs/actionArray"
+    }
   ],
   "$defs": {
     "pathPatterns": {
@@ -22,48 +28,108 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "id": { "type": "string", "maxLength": 120 },
-        "model": { "type": "string", "maxLength": 120 }
+        "id": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "model": {
+          "type": "string",
+          "maxLength": 120
+        }
       }
     },
     "contract": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "allowedPaths": { "$ref": "#/$defs/pathPatterns" },
-        "blockedPaths": { "$ref": "#/$defs/pathPatterns" },
-        "requiredPaths": { "$ref": "#/$defs/pathPatterns" },
-        "expectedOutputs": { "$ref": "#/$defs/pathPatterns" }
+        "allowedPaths": {
+          "$ref": "#/$defs/pathPatterns"
+        },
+        "blockedPaths": {
+          "$ref": "#/$defs/pathPatterns"
+        },
+        "requiredPaths": {
+          "$ref": "#/$defs/pathPatterns"
+        },
+        "expectedOutputs": {
+          "$ref": "#/$defs/pathPatterns"
+        }
       }
     },
     "action": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "operation"],
+      "required": [
+        "path",
+        "operation"
+      ],
       "properties": {
-        "path": { "type": "string", "minLength": 1, "maxLength": 500 },
-        "operation": { "type": "string", "enum": ["CREATE", "MODIFY", "DELETE", "READ"] },
-        "intent": { "type": "string", "enum": ["MUTATE", "NOOP", "UNKNOWN"] },
-        "description": { "type": "string", "maxLength": 500 },
-        "content": { "type": "string" },
-        "contentHash": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" }
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "CREATE",
+            "MODIFY",
+            "DELETE",
+            "READ"
+          ]
+        },
+        "intent": {
+          "type": "string",
+          "enum": [
+            "MUTATE",
+            "NOOP",
+            "UNKNOWN"
+          ]
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "content": {
+          "type": "string"
+        },
+        "contentHash": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        }
       }
     },
     "actionsEnvelope": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["actions"],
+      "required": [
+        "actions"
+      ],
       "properties": {
-        "request": { "type": "string", "maxLength": 500 },
-        "summary": { "type": "string", "maxLength": 500 },
-        "agent": { "$ref": "#/$defs/agent" },
-        "metadata": { "type": "object" },
-        "contract": { "$ref": "#/$defs/contract" },
+        "request": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "agent": {
+          "$ref": "#/$defs/agent"
+        },
+        "metadata": {
+          "type": "object"
+        },
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
         "actions": {
           "type": "array",
           "minItems": 1,
           "maxItems": 500,
-          "items": { "$ref": "#/$defs/action" }
+          "items": {
+            "$ref": "#/$defs/action"
+          }
         }
       }
     },
@@ -71,24 +137,50 @@
       "type": "object",
       "additionalProperties": false,
       "anyOf": [
-        { "required": ["output"] },
-        { "required": ["text"] }
+        {
+          "required": [
+            "output"
+          ]
+        },
+        {
+          "required": [
+            "text"
+          ]
+        }
       ],
       "properties": {
-        "request": { "type": "string", "maxLength": 500 },
-        "summary": { "type": "string", "maxLength": 500 },
-        "agent": { "$ref": "#/$defs/agent" },
-        "metadata": { "type": "object" },
-        "contract": { "$ref": "#/$defs/contract" },
-        "output": { "type": "string" },
-        "text": { "type": "string" }
+        "request": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "agent": {
+          "$ref": "#/$defs/agent"
+        },
+        "metadata": {
+          "type": "object"
+        },
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "output": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
       }
     },
     "actionArray": {
       "type": "array",
       "minItems": 1,
       "maxItems": 500,
-      "items": { "$ref": "#/$defs/action" }
+      "items": {
+        "$ref": "#/$defs/action"
+      }
     }
   }
 }

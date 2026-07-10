@@ -8,6 +8,7 @@ import {
   type SendOptions,
   type StreamOptions,
   type UnifiedResponse,
+  ProviderError,
 } from '../src/providers/types.js';
 
 function makeResponse(providerId: string): UnifiedResponse {
@@ -94,13 +95,69 @@ describe('orchestrator concurrency admission', () => {
 
     const inflight = [orch.sendMessage(messages, sendOptions), orch.sendMessage(messages, sendOptions)];
     await new Promise((r) => setTimeout(r, 25));
+
+    // The second request is queued. maxConcurrency is a hard cap, even when no
+    // fallback provider exists.
+    assert.equal(only.calls, 1);
+    assert.equal(only.peak, 1);
+
     gate.resolve();
     const results = await Promise.all(inflight);
 
-    // No alternative provider: the last-resort path admits both rather than
-    // failing, and the slot is still released afterwards.
     assert.equal(results.length, 2);
     assert.equal(only.calls, 2);
+    assert.equal(only.peak, 1);
+    assert.equal(orch.getProviderHealth()[0].concurrency, 0);
+  });
+
+  it('queues a saturated forced provider instead of silently routing elsewhere', async () => {
+    const gate = deferred<void>();
+    const forced = new GatedProvider('forced', gate.promise);
+    const alternative = new GatedProvider('alternative', Promise.resolve());
+    const orch = new ProviderOrchestrator(noopTelemetry);
+    orch.registerProvider(forced, { priority: 0, maxConcurrency: 1 });
+    orch.registerProvider(alternative, { priority: 1, maxConcurrency: 1 });
+
+    const options = { ...sendOptions, forceProvider: 'forced' };
+    const first = orch.sendMessage(messages, options);
+    await new Promise((r) => setTimeout(r, 10));
+    const second = orch.sendMessage(messages, options);
+    await new Promise((r) => setTimeout(r, 20));
+
+    assert.equal(forced.calls, 1);
+    assert.equal(alternative.calls, 0);
+    assert.equal(forced.peak, 1);
+
+    gate.resolve();
+    const results = await Promise.all([first, second]);
+    assert.deepEqual(results.map((result) => result.metadata.providerId), ['forced', 'forced']);
+    assert.equal(forced.calls, 2);
+    assert.equal(forced.peak, 1);
+  });
+
+  it('removes an aborted request from the capacity queue without calling the provider', async () => {
+    const gate = deferred<void>();
+    const only = new GatedProvider('only', gate.promise);
+    const orch = new ProviderOrchestrator(noopTelemetry);
+    orch.registerProvider(only, { priority: 0, maxConcurrency: 1 });
+
+    const first = orch.sendMessage(messages, sendOptions);
+    await new Promise((r) => setTimeout(r, 10));
+
+    const controller = new AbortController();
+    const queued = orch.sendMessage(messages, { ...sendOptions, signal: controller.signal });
+    await new Promise((r) => setTimeout(r, 10));
+    controller.abort(new Error('caller stopped waiting'));
+
+    await assert.rejects(queued, (error: unknown) => {
+      assert.ok(error instanceof ProviderError);
+      assert.equal(error.kind, 'cancelled');
+      return true;
+    });
+    assert.equal(only.calls, 1);
+
+    gate.resolve();
+    await first;
     assert.equal(orch.getProviderHealth()[0].concurrency, 0);
   });
 });

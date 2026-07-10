@@ -9,9 +9,14 @@ import {
   type ProviderConfig,
   type ProviderStatus,
   type OrchestrationEvent,
+  type ProviderFailureReason,
   ProviderError,
+  isRetryableKind,
+  kindFromStatus,
 } from './types.js';
-import { calculateCost } from './pricing.js';
+import { estimateCost } from './pricing.js';
+import { extractStatusCode, failureReasonFromError } from './errors.js';
+import { messagesCharLength, serializeMessageForRouting } from './messages.js';
 
 // ── EMA-Based Model Metrics ──────────────────────────────────
 interface ModelMetrics {
@@ -48,81 +53,70 @@ const DEFAULT_WATCHDOG_MS = 15_000;
 const WATCHDOG_LATENCY_MULTIPLIER = 3;
 
 // ── Retryable Error Detection ────────────────────────────────
-const RETRYABLE_STATUS_CODES = new Set([429, 502, 503, 529]);
-
 export function isRetryableError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
 
-  // Authoritative: a typed ProviderError carries an explicit retryable flag, so
-  // we never have to guess. This is the path providers throw on; everything
-  // below is heuristic fallback for raw SDK/network errors.
   if (err instanceof ProviderError) {
     return err.retryable;
   }
 
-  // Prefer a real status code carried on the error object (the Anthropic and
-  // OpenAI SDKs both expose `.status`; fetch-style errors may use `.statusCode`
-  // or nest it under `.response.status`). This is authoritative — far better
-  // than scanning the message, where a byte count like "15029 bytes" or an id
-  // like "req_5290" would otherwise look like a 429/502/503/529.
   const status = extractStatusCode(err);
   if (status !== undefined) {
-    return RETRYABLE_STATUS_CODES.has(status);
+    return isRetryableKind(kindFromStatus(status));
   }
 
+  const name = err.name.toLowerCase();
   const msg = err.message.toLowerCase();
+  if (name === 'apiconnectiontimeouterror' || name === 'timeouterror') return true;
+  if (name === 'apiconnectionerror') return true;
 
-  // Network errors
-  if (msg.includes('econnrefused') || msg.includes('econnreset') ||
-    msg.includes('etimedout') || msg.includes('enotfound') ||
-    msg.includes('fetch failed') || msg.includes('network')) {
+  if (
+    msg.includes('econnrefused') ||
+    msg.includes('econnreset') ||
+    msg.includes('etimedout') ||
+    msg.includes('enotfound') ||
+    msg.includes('eai_again') ||
+    msg.includes('fetch failed') ||
+    msg.includes('network error')
+  ) {
     return true;
   }
 
-  // HTTP status code errors — only when the code appears as a standalone token
-  // (not embedded in a larger number/identifier), so "529" matches but
-  // "req_5290" and "15029 bytes" do not.
-  for (const code of RETRYABLE_STATUS_CODES) {
+  // Last-resort compatibility for raw SDK errors that expose a status only in
+  // the message. Match standalone tokens so request ids and byte counts cannot
+  // masquerade as HTTP status codes.
+  for (const code of [408, 429, 500, 501, 502, 503, 504, 529]) {
     const tokenRe = new RegExp(`(?<![0-9])${code}(?![0-9])`);
     if (tokenRe.test(msg)) return true;
   }
 
-  // Anthropic-specific overload messages
-  if (msg.includes('overloaded') || msg.includes('rate limit')) return true;
-
-  return false;
+  return msg.includes('overloaded') || msg.includes('rate limit');
 }
 
-// Best-effort extraction of an HTTP status code from common SDK error shapes.
-function extractStatusCode(err: unknown): number | undefined {
-  if (typeof err !== 'object' || err === null) return undefined;
-  const anyErr = err as Record<string, unknown>;
-  const candidates: unknown[] = [
-    anyErr.status,
-    anyErr.statusCode,
-    (anyErr.response as Record<string, unknown> | undefined)?.status,
-  ];
-  for (const candidate of candidates) {
-    if (typeof candidate === 'number' && Number.isInteger(candidate)) return candidate;
-  }
-  return undefined;
+function cancellationFromSignal(signal?: AbortSignal): ProviderError {
+  if (signal?.reason instanceof ProviderError) return signal.reason;
+  const cause = signal?.reason;
+  const detail = cause instanceof Error ? cause.message : 'request cancelled';
+  return new ProviderError(detail, {
+    kind: 'cancelled',
+    retryable: false,
+    cause,
+  });
 }
 
-function extractFallbackReason(err: unknown): OrchestrationEvent['fallbackReason'] {
-  if (err instanceof ProviderError) {
-    switch (err.kind) {
-      case 'rate_limit': return 'rate_limit';
-      case 'timeout': return 'timeout';
-      case 'network': return 'network_error';
-      default: return 'server_error';
-    }
+class ProviderAttemptFailure extends Error {
+  constructor(
+    readonly providerError: Error,
+    readonly retryCount: number,
+  ) {
+    super(providerError.message, { cause: providerError });
+    this.name = 'ProviderAttemptFailure';
   }
-  if (!(err instanceof Error)) return 'server_error';
-  const msg = err.message.toLowerCase();
-  if (msg.includes('429') || msg.includes('rate limit')) return 'rate_limit';
-  if (msg.includes('timeout') || msg.includes('etimedout')) return 'timeout';
-  if (msg.includes('econnrefused') || msg.includes('network') || msg.includes('fetch failed')) return 'network_error';
-  return 'server_error';
+}
+
+interface RetryResult<T> {
+  value: T;
+  retryCount: number;
 }
 
 // ── Scoring Algorithm ────────────────────────────────────────
@@ -150,7 +144,7 @@ function deterministicSelect(
   providers: ProviderSlot[],
 ): ProviderSlot {
   // Hash the input to get a stable provider index
-  const payload = messages.map(m => `${m.role}:${m.content}`).join('|');
+  const payload = messages.map(serializeMessageForRouting).join('|');
   const hash = createHash('sha256').update(payload).digest();
   const index = hash.readUInt32BE(0) % providers.length;
   return providers[index];
@@ -162,6 +156,7 @@ export class ProviderOrchestrator {
   private eventLog: OrchestrationEvent[] = [];
   private sessionId: string;
   private telemetry: OrchestratorTelemetry;
+  private capacityWaiters = new Set<() => void>();
 
   constructor(telemetry?: OrchestratorTelemetry) {
     this.sessionId = createHash('sha256')
@@ -186,11 +181,16 @@ export class ProviderOrchestrator {
 
   // ── Provider Registration ────────────────────────────────
   registerProvider(provider: BaseProvider, config?: Partial<ProviderConfig>): void {
+    const requestedMaxConcurrency = config?.maxConcurrency ?? 3;
+    if (!Number.isInteger(requestedMaxConcurrency) || requestedMaxConcurrency < 1) {
+      throw new Error(`Provider '${provider.id}' maxConcurrency must be a positive integer.`);
+    }
+
     const fullConfig: ProviderConfig = {
       id: provider.id,
       priority: config?.priority ?? this.slots.length,
       enabled: config?.enabled ?? true,
-      maxConcurrency: config?.maxConcurrency ?? 3,
+      maxConcurrency: requestedMaxConcurrency,
     };
 
     this.slots.push({
@@ -228,41 +228,34 @@ export class ProviderOrchestrator {
       }
     }
 
-    // Filter to eligible providers
-    let eligible = this.slots.filter(slot => {
-      if (!slot.config.enabled) return false;
-      if (slot.status === 'down') return false;
-
-      // Concurrency check (skip full providers unless they're the only option)
-      if (slot.activeConcurrency >= slot.config.maxConcurrency) return false;
-
-      return true;
-    });
-
-    // If all providers are at max concurrency, allow degraded ones
-    if (eligible.length === 0) {
-      eligible = this.slots.filter(slot =>
-        slot.config.enabled && slot.status !== 'down'
-      );
-    }
-
-    if (eligible.length === 0) {
+    const routable = this.slots.filter(slot =>
+      slot.config.enabled && slot.status !== 'down'
+    );
+    if (routable.length === 0) {
       throw new Error('No providers available. All registered providers are down or disabled.');
     }
 
-    // Explicit force provider
+    // Forced and deterministic routing select from all routable providers and
+    // then wait for their hard concurrency slot. Saturation must not silently
+    // change an explicitly requested or deterministic provider.
     if (options.forceProvider) {
-      const forced = eligible.find(s => s.provider.id === options.forceProvider);
+      const forced = routable.find(s => s.provider.id === options.forceProvider);
       if (!forced) {
         throw new Error(`Forced provider '${options.forceProvider}' is not available or disabled.`);
       }
       return [forced];
     }
-
-    // Deterministic mode: fixed selection via hash
     if (options.deterministic) {
-      return [deterministicSelect(messages, eligible)];
+      return [deterministicSelect(messages, routable)];
     }
+
+    // Adaptive routing prefers providers with immediate capacity. If every
+    // provider is saturated, keep all candidates and queue until the first hard
+    // slot becomes available rather than exceeding maxConcurrency.
+    const available = routable.filter(
+      slot => slot.activeConcurrency < slot.config.maxConcurrency,
+    );
+    const eligible = available.length > 0 ? available : routable;
 
     // Adaptive mode: sort by score (highest first)
     const taskType = options.taskType ?? 'unknown';
@@ -287,13 +280,15 @@ export class ProviderOrchestrator {
   }
 
   // ── Update Metrics (EMA) ─────────────────────────────────
-  private recordSuccess(slot: ProviderSlot, latencyMs: number, cost: number): void {
+  private recordSuccess(slot: ProviderSlot, latencyMs: number, costPer1k: number): void {
     const m = slot.metrics;
     m.prevSuccessRate = m.successRate;
     m.prevAvgLatency = m.avgLatency;
     m.successRate = m.successRate * (1 - EMA_ALPHA) + 1.0 * EMA_ALPHA;
     m.avgLatency = m.avgLatency * (1 - EMA_ALPHA) + latencyMs * EMA_ALPHA;
-    m.costPer1k = cost > 0 ? m.costPer1k * (1 - EMA_ALPHA) + cost * EMA_ALPHA : m.costPer1k;
+    m.costPer1k = costPer1k > 0
+      ? m.costPer1k * (1 - EMA_ALPHA) + costPer1k * EMA_ALPHA
+      : m.costPer1k;
     m.totalCalls++;
     m.consecutiveFailures = 0;
     this.pushTelemetryState(slot);
@@ -345,40 +340,109 @@ export class ProviderOrchestrator {
     return Math.max(DEFAULT_WATCHDOG_MS, slot.metrics.avgLatency * WATCHDOG_LATENCY_MULTIPLIER);
   }
 
+  // ── Hard Concurrency Admission ────────────────────────────
+  private async acquireCandidate(
+    candidates: ProviderSlot[],
+    attempted: ReadonlySet<ProviderSlot>,
+    signal?: AbortSignal,
+  ): Promise<ProviderSlot | null> {
+    while (true) {
+      if (signal?.aborted) throw cancellationFromSignal(signal);
+
+      const remaining = candidates.filter(slot => !attempted.has(slot));
+      if (remaining.length === 0) return null;
+
+      const available = remaining.find(
+        slot => slot.activeConcurrency < slot.config.maxConcurrency,
+      );
+      if (available) {
+        available.activeConcurrency++;
+        return available;
+      }
+
+      await this.waitForCapacity(signal);
+    }
+  }
+
+  private waitForCapacity(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.reject(cancellationFromSignal(signal));
+
+    return new Promise<void>((resolve, reject) => {
+      const wake = () => {
+        cleanup();
+        resolve();
+      };
+      const onAbort = () => {
+        cleanup();
+        reject(cancellationFromSignal(signal));
+      };
+      const cleanup = () => {
+        this.capacityWaiters.delete(wake);
+        signal?.removeEventListener('abort', onAbort);
+      };
+
+      this.capacityWaiters.add(wake);
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  private releaseCandidate(slot: ProviderSlot): void {
+    slot.activeConcurrency = Math.max(0, slot.activeConcurrency - 1);
+    if (this.capacityWaiters.size === 0) return;
+
+    // Wake every waiter. Each re-checks the hard cap synchronously before it can
+    // acquire a slot, so no provider can exceed maxConcurrency. Broadcasting
+    // avoids starving a waiter whose forced provider differs from the slot that
+    // just became available.
+    const waiters = [...this.capacityWaiters];
+    this.capacityWaiters.clear();
+    for (const wake of waiters) wake();
+  }
+
   // ── Retry with Exponential Backoff ───────────────────────
   private async retryWithBackoff<T>(
     fn: () => Promise<T>,
     signal?: AbortSignal,
-  ): Promise<T> {
-    let lastErr: Error | null = null;
+  ): Promise<RetryResult<T>> {
+    let retryCount = 0;
 
     for (let attempt = 0; attempt <= RETRY_BACKOFFS_MS.length; attempt++) {
+      if (signal?.aborted) {
+        throw new ProviderAttemptFailure(cancellationFromSignal(signal), retryCount);
+      }
+
       try {
-        return await fn();
-      } catch (err) {
-        lastErr = err instanceof Error ? err : new Error(String(err));
+        return { value: await fn(), retryCount };
+      } catch (error) {
+        const providerError = error instanceof Error ? error : new Error(String(error));
 
-        // Non-retryable errors fail immediately
-        if (!isRetryableError(err)) throw lastErr;
+        if (signal?.aborted) {
+          throw new ProviderAttemptFailure(cancellationFromSignal(signal), retryCount);
+        }
+        if (!isRetryableError(providerError) || attempt >= RETRY_BACKOFFS_MS.length) {
+          throw new ProviderAttemptFailure(providerError, retryCount);
+        }
 
-        // Exhausted retries
-        if (attempt >= RETRY_BACKOFFS_MS.length) break;
-
-        // Check abort signal
-        if (signal?.aborted) throw lastErr;
-
-        // Backoff delay
+        retryCount++;
         const delay = RETRY_BACKOFFS_MS[attempt];
-        await new Promise<void>(resolve => {
-          const timer = setTimeout(resolve, delay);
-          if (signal) {
-            const onAbort = () => { clearTimeout(timer); resolve(); };
-            signal.addEventListener('abort', onAbort, { once: true });
-          }
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            cleanup();
+            resolve();
+          }, delay);
+
+          const onAbort = () => {
+            clearTimeout(timer);
+            cleanup();
+            reject(new ProviderAttemptFailure(cancellationFromSignal(signal), retryCount));
+          };
+          const cleanup = () => signal?.removeEventListener('abort', onAbort);
+          signal?.addEventListener('abort', onAbort, { once: true });
         });
       }
     }
-    throw lastErr!;
+
+    throw new ProviderAttemptFailure(new Error('Retry loop exhausted unexpectedly.'), retryCount);
   }
 
   // ── Stream Message (Primary API) ─────────────────────────
@@ -389,7 +453,7 @@ export class ProviderOrchestrator {
   ): void {
     if (candidates.length === 0) return;
 
-    const totalChars = messages.reduce((acc, m) => acc + m.content.length, 0);
+    const totalChars = messagesCharLength(messages);
     const tokenEstimate = Math.ceil(totalChars / 4);
     let bucket = '<4k';
     if (tokenEstimate >= 4000 && tokenEstimate < 16000) bucket = '4k-16k';
@@ -421,53 +485,39 @@ export class ProviderOrchestrator {
     const taskType = options.taskType ?? 'unknown';
     this.logRoutingDecision(messages, taskType, candidates);
 
-    let fallbackTriggered = false;
-    let primaryProvider = candidates[0]?.provider.id ?? 'none';
-    let retryCount = 0;
+    const primaryProvider = candidates[0]?.provider.id ?? 'none';
+    const attempted = new Set<ProviderSlot>();
+    let totalRetryCount = 0;
+    let fallbackCount = 0;
+    let lastFallbackReason: ProviderFailureReason | undefined;
 
-    // Compute capacity once: if at least one candidate has headroom, skip slots
-    // that filled up between selection and admission so a slot is never pushed
-    // past maxConcurrency under concurrent load. If every candidate is already
-    // full, preserve the existing last-resort fallback (admit anyway).
-    const anyHasCapacity = candidates.some(s => s.activeConcurrency < s.config.maxConcurrency);
+    while (true) {
+      const slot = await this.acquireCandidate(candidates, attempted, options.signal);
+      if (!slot) break;
+      attempted.add(slot);
 
-    for (const slot of candidates) {
-      if (anyHasCapacity && slot.activeConcurrency >= slot.config.maxConcurrency) {
-        continue;
-      }
-      // Acquire concurrency slot
-      slot.activeConcurrency++;
-
-      // Hoisted above the try so the finally can always clear it. If it stayed
-      // inside the try, a throw from retryWithBackoff would leave the timer
-      // armed (the catch is out of the try block's scope), leaking a setTimeout
-      // that fires later and aborts an abandoned controller.
       let watchdogTimer: ReturnType<typeof setTimeout> | null = null;
-
       try {
-        // Set up the adaptive watchdog
         const watchdogMs = options.timeoutMs ?? this.getWatchdogTimeout(slot);
         const watchdogController = new AbortController();
-        let lastChunkTime = Date.now();
-
-        // Create a composite abort signal
         const compositeSignal = options.signal
           ? AbortSignal.any([options.signal, watchdogController.signal])
           : watchdogController.signal;
 
-        // Start watchdog
         const resetWatchdog = () => {
-          lastChunkTime = Date.now();
           if (watchdogTimer) clearTimeout(watchdogTimer);
           watchdogTimer = setTimeout(() => {
-            watchdogController.abort();
+            watchdogController.abort(new ProviderError(
+              `[${slot.provider.id}] stream watchdog timed out after ${Math.round(watchdogMs)}ms`,
+              {
+                kind: 'timeout',
+                providerId: slot.provider.id,
+              },
+            ));
           }, watchdogMs);
-          // Defense in depth: never let a stray watchdog hold the event loop open.
-          watchdogTimer.unref?.();
         };
         resetWatchdog();
 
-        // Wrap callbacks to reset watchdog on every chunk
         const wrappedOptions: StreamOptions = {
           ...options,
           signal: compositeSignal,
@@ -481,72 +531,75 @@ export class ProviderOrchestrator {
           },
         };
 
-        const response = await this.retryWithBackoff(
+        const attempt = await this.retryWithBackoff(
           () => slot.provider.streamMessage(messages, wrappedOptions),
           compositeSignal,
         );
-
-        // Clear watchdog
-        if (watchdogTimer) clearTimeout(watchdogTimer);
+        totalRetryCount += attempt.retryCount;
+        const response = attempt.value;
 
         if (response.metadata.incomplete) {
-          throw new Error(`${slot.provider.id} returned incomplete response (watchdog timeout)`);
+          if (options.signal?.aborted) throw cancellationFromSignal(options.signal);
+          if (watchdogController.signal.aborted) {
+            throw cancellationFromSignal(watchdogController.signal);
+          }
+          throw new ProviderError(
+            `[${slot.provider.id}] returned an incomplete response`,
+            {
+              kind: 'incomplete_response',
+              providerId: slot.provider.id,
+            },
+          );
         }
 
-        // Record success metrics
-        const cost = calculateCost(
+        const cost = estimateCost(
           response.metadata.modelId,
           response.usage.inputTokens,
           response.usage.outputTokens,
           slot.provider.id,
         );
-        this.recordSuccess(slot, response.usage.latencyMs, cost);
+        this.recordSuccess(slot, response.usage.latencyMs, cost.costPer1k);
+        response.metadata.fallbackTriggered = fallbackCount > 0;
 
-        // Stamp metadata
-        response.metadata.fallbackTriggered = fallbackTriggered;
-
-        // Log orchestration event
         this.logEvent({
           timestamp: new Date().toISOString(),
           sessionId: this.sessionId,
           command: 'stream',
           primaryProvider,
           actualProvider: slot.provider.id,
-          fallbackReason: fallbackTriggered ? 'server_error' : undefined,
+          fallbackReason: lastFallbackReason,
           latencyMs: response.usage.latencyMs,
-          cost,
-          retryCount,
+          cost: cost.totalCost,
+          costPer1k: cost.costPer1k,
+          retryCount: totalRetryCount,
+          fallbackCount,
         });
 
         return response;
+      } catch (rawError) {
+        const failure = rawError instanceof ProviderAttemptFailure
+          ? rawError
+          : new ProviderAttemptFailure(
+            rawError instanceof Error ? rawError : new Error(String(rawError)),
+            0,
+          );
+        totalRetryCount += failure.retryCount;
+        const error = failure.providerError;
 
-      } catch (err) {
-        const error = err instanceof Error ? err : new Error(String(err));
-
-        // If this was a watchdog abort, mark incomplete
-        if (error.message === 'Stream aborted by signal' || error.message.includes('aborted')) {
-          // The provider should have returned a partial response
-          // but if it threw, we need to continue to fallback
+        if (options.signal?.aborted) {
+          throw cancellationFromSignal(options.signal);
         }
 
-        // Record failure and prepare for fallback
         this.recordFailure(slot, error);
         this.maybeTripCircuitBreaker(slot, error);
-        retryCount++;
-        fallbackTriggered = true;
-
-        if (options.allowFallback === false) {
-          throw error;
-        }
-
-        const reason = extractFallbackReason(err);
+        const reason = failureReasonFromError(error);
 
         this.telemetry.logFailure({
           timestamp: Date.now(),
           provider: slot.provider.id,
-          errorType: reason ?? 'server_error',
+          errorType: reason,
           shortMessage: error.message.slice(0, 100),
-          fullStack: error.stack || error.message
+          fullStack: error.stack || error.message,
         });
 
         this.logEvent({
@@ -558,26 +611,29 @@ export class ProviderOrchestrator {
           fallbackReason: reason,
           latencyMs: 0,
           cost: 0,
-          retryCount,
+          costPer1k: 0,
+          retryCount: totalRetryCount,
+          fallbackCount,
         });
 
-        // Deterministic mode: don't fallback (except hard 5xx)
+        if (options.allowFallback === false) throw error;
         if (options.deterministic) {
           throw new Error(
             `[orchestrator] Deterministic mode: ${slot.provider.id} failed and fallback is disabled. ` +
-            `Error: ${error.message}`
+            `Error: ${error.message}`,
+            { cause: error },
           );
         }
 
-        // Try next provider
-        continue;
+        if (attempted.size < candidates.length) {
+          lastFallbackReason = reason;
+          fallbackCount++;
+          continue;
+        }
+        break;
       } finally {
-        // Single owner of concurrency release — runs exactly once
-        // regardless of success (return) or failure (continue)
-        slot.activeConcurrency--;
-        // Always clear the watchdog, including the throw/continue path where
-        // the success-path clear above is skipped.
         if (watchdogTimer) clearTimeout(watchdogTimer);
+        this.releaseCandidate(slot);
       }
     }
 
@@ -593,36 +649,64 @@ export class ProviderOrchestrator {
     const taskType = options.taskType ?? 'unknown';
     this.logRoutingDecision(messages, taskType, candidates);
 
-    let fallbackTriggered = false;
-    let primaryProvider = candidates[0]?.provider.id ?? 'none';
-    let retryCount = 0;
+    const primaryProvider = candidates[0]?.provider.id ?? 'none';
+    const attempted = new Set<ProviderSlot>();
+    let totalRetryCount = 0;
+    let fallbackCount = 0;
+    let lastFallbackReason: ProviderFailureReason | undefined;
 
-    const anyHasCapacity = candidates.some(s => s.activeConcurrency < s.config.maxConcurrency);
+    while (true) {
+      const slot = await this.acquireCandidate(candidates, attempted, options.signal);
+      if (!slot) break;
+      attempted.add(slot);
 
-    for (const slot of candidates) {
-      if (anyHasCapacity && slot.activeConcurrency >= slot.config.maxConcurrency) {
-        continue;
-      }
-      slot.activeConcurrency++;
-
+      let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
       try {
-        const response = await this.retryWithBackoff(
-          () => slot.provider.sendMessage(messages, options),
-          options.signal,
-        );
-
-        if (response.metadata.incomplete) {
-          throw new Error(`${slot.provider.id} returned incomplete response`);
+        let requestSignal = options.signal;
+        if (options.timeoutMs !== undefined) {
+          const timeoutMs = options.timeoutMs;
+          const timeoutController = new AbortController();
+          timeoutTimer = setTimeout(() => {
+            timeoutController.abort(new ProviderError(
+              `[${slot.provider.id}] request timed out after ${Math.round(timeoutMs)}ms`,
+              {
+                kind: 'timeout',
+                providerId: slot.provider.id,
+              },
+            ));
+          }, timeoutMs);
+          requestSignal = options.signal
+            ? AbortSignal.any([options.signal, timeoutController.signal])
+            : timeoutController.signal;
         }
 
-        const cost = calculateCost(
+        const attempt = await this.retryWithBackoff(
+          () => slot.provider.sendMessage(messages, { ...options, signal: requestSignal }),
+          requestSignal,
+        );
+        totalRetryCount += attempt.retryCount;
+        const response = attempt.value;
+
+        if (response.metadata.incomplete) {
+          if (options.signal?.aborted) throw cancellationFromSignal(options.signal);
+          if (requestSignal?.aborted) throw cancellationFromSignal(requestSignal);
+          throw new ProviderError(
+            `[${slot.provider.id}] returned an incomplete response`,
+            {
+              kind: 'incomplete_response',
+              providerId: slot.provider.id,
+            },
+          );
+        }
+
+        const cost = estimateCost(
           response.metadata.modelId,
           response.usage.inputTokens,
           response.usage.outputTokens,
           slot.provider.id,
         );
-        this.recordSuccess(slot, response.usage.latencyMs, cost);
-        response.metadata.fallbackTriggered = fallbackTriggered;
+        this.recordSuccess(slot, response.usage.latencyMs, cost.costPer1k);
+        response.metadata.fallbackTriggered = fallbackCount > 0;
 
         this.logEvent({
           timestamp: new Date().toISOString(),
@@ -630,43 +714,72 @@ export class ProviderOrchestrator {
           command: 'send',
           primaryProvider,
           actualProvider: slot.provider.id,
-          fallbackReason: fallbackTriggered ? 'server_error' : undefined,
+          fallbackReason: lastFallbackReason,
           latencyMs: response.usage.latencyMs,
-          cost,
-          retryCount,
+          cost: cost.totalCost,
+          costPer1k: cost.costPer1k,
+          retryCount: totalRetryCount,
+          fallbackCount,
         });
 
         return response;
+      } catch (rawError) {
+        const failure = rawError instanceof ProviderAttemptFailure
+          ? rawError
+          : new ProviderAttemptFailure(
+            rawError instanceof Error ? rawError : new Error(String(rawError)),
+            0,
+          );
+        totalRetryCount += failure.retryCount;
+        const error = failure.providerError;
 
-      } catch (err) {
-        const error = err instanceof Error ? err : new Error(String(err));
+        if (options.signal?.aborted) {
+          throw cancellationFromSignal(options.signal);
+        }
+
         this.recordFailure(slot, error);
         this.maybeTripCircuitBreaker(slot, error);
-        retryCount++;
-        fallbackTriggered = true;
-
-        if (options.allowFallback === false) {
-          throw error;
-        }
+        const reason = failureReasonFromError(error);
 
         this.telemetry.logFailure({
           timestamp: Date.now(),
           provider: slot.provider.id,
-          errorType: 'server_error',
+          errorType: reason,
           shortMessage: error.message.slice(0, 100),
-          fullStack: error.stack || error.message
+          fullStack: error.stack || error.message,
         });
 
+        this.logEvent({
+          timestamp: new Date().toISOString(),
+          sessionId: this.sessionId,
+          command: 'send',
+          primaryProvider,
+          actualProvider: slot.provider.id,
+          fallbackReason: reason,
+          latencyMs: 0,
+          cost: 0,
+          costPer1k: 0,
+          retryCount: totalRetryCount,
+          fallbackCount,
+        });
+
+        if (options.allowFallback === false) throw error;
         if (options.deterministic) {
           throw new Error(
-            `[orchestrator] Deterministic mode: ${slot.provider.id} failed. Error: ${error.message}`
+            `[orchestrator] Deterministic mode: ${slot.provider.id} failed. Error: ${error.message}`,
+            { cause: error },
           );
         }
 
-        continue;
+        if (attempted.size < candidates.length) {
+          lastFallbackReason = reason;
+          fallbackCount++;
+          continue;
+        }
+        break;
       } finally {
-        // Single owner of concurrency release
-        slot.activeConcurrency--;
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+        this.releaseCandidate(slot);
       }
     }
 

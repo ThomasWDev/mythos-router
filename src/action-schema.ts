@@ -1,16 +1,28 @@
 import { parseActions, type FileAction } from './swd.js';
 import { assertSafeRelativePathShape, isSafeRelativePathShape, normalizeRelativePath } from './path-safety.js';
 import { matchesPolicyPattern, normalizePolicyPath } from './project-policy.js';
+import { assertKnownProperties } from './object-validation.js';
 
 export const EXTERNAL_AGENT_ACTION_SCHEMA_VERSION = 1;
 export const EXTERNAL_AGENT_ACTION_SCHEMA_ID = 'https://mythos-router.local/schemas/external-agent-actions.schema.json';
 export const MAX_AGENT_INPUT_BYTES = 1_000_000;
+export const MAX_EXTERNAL_AGENT_ACTIONS = 500;
+export const MAX_ACTION_PATH_LENGTH = 500;
+export const MAX_ACTION_DESCRIPTION_LENGTH = 500;
+export const MAX_ENVELOPE_TEXT_LENGTH = 500;
+export const MAX_AGENT_ID_LENGTH = 120;
+export const MAX_AGENT_MODEL_LENGTH = 120;
+export const MAX_CONTRACT_PATTERNS = 100;
+export const MAX_CONTRACT_PATTERN_LENGTH = 240;
 
 const VALID_OPERATIONS = new Set<FileAction['operation']>(['CREATE', 'MODIFY', 'DELETE', 'READ']);
 const VALID_INTENTS = new Set<FileAction['intent']>(['MUTATE', 'NOOP', 'UNKNOWN']);
-const MAX_PATH_LENGTH = 500;
-const MAX_CONTRACT_PATTERNS = 100;
-const MAX_CONTRACT_PATTERN_LENGTH = 240;
+const ENVELOPE_COMMON_KEYS = ['request', 'summary', 'agent', 'metadata', 'contract'] as const;
+const ACTION_ENVELOPE_KEYS = [...ENVELOPE_COMMON_KEYS, 'actions'] as const;
+const TEXT_ENVELOPE_KEYS = [...ENVELOPE_COMMON_KEYS, 'output', 'text'] as const;
+const ACTION_KEYS = ['path', 'operation', 'intent', 'description', 'content', 'contentHash'] as const;
+const AGENT_KEYS = ['id', 'model'] as const;
+const CONTRACT_KEYS = ['allowedPaths', 'blockedPaths', 'requiredPaths', 'expectedOutputs'] as const;
 
 export interface TaskContract {
   allowedPaths?: string[];
@@ -48,6 +60,11 @@ export interface ExternalAgentValidation {
   contract?: TaskContractValidation;
 }
 
+/**
+ * Published schema and runtime parsing intentionally share these exported
+ * limits. A conformance test verifies that the checked-in JSON schema is
+ * byte-for-byte equivalent after JSON parsing.
+ */
 export const EXTERNAL_AGENT_ACTION_SCHEMA = {
   $schema: 'https://json-schema.org/draft/2020-12/schema',
   $id: EXTERNAL_AGENT_ACTION_SCHEMA_ID,
@@ -55,7 +72,8 @@ export const EXTERNAL_AGENT_ACTION_SCHEMA = {
   description:
     'Input accepted by `mythos swd apply` / `mythos swd validate` and the MCP swd_* tools. ' +
     'Three shapes are accepted: (1) an object with an `actions` array, (2) an object carrying ' +
-    'raw FILE_ACTION text in `output` or `text`, or (3) a bare array of action objects.',
+    'raw FILE_ACTION text in `output` or `text`, or (3) a bare array of action objects. JSON ' +
+    'operation and intent values are uppercase and case-sensitive.',
   oneOf: [
     { $ref: '#/$defs/actionsEnvelope' },
     { $ref: '#/$defs/textEnvelope' },
@@ -67,8 +85,8 @@ export const EXTERNAL_AGENT_ACTION_SCHEMA = {
       type: 'object',
       additionalProperties: false,
       properties: {
-        id: { type: 'string', maxLength: 120 },
-        model: { type: 'string', maxLength: 120 },
+        id: { type: 'string', maxLength: MAX_AGENT_ID_LENGTH },
+        model: { type: 'string', maxLength: MAX_AGENT_MODEL_LENGTH },
       },
     },
     contract: {
@@ -86,10 +104,10 @@ export const EXTERNAL_AGENT_ACTION_SCHEMA = {
       additionalProperties: false,
       required: ['path', 'operation'],
       properties: {
-        path: { type: 'string', minLength: 1, maxLength: MAX_PATH_LENGTH },
+        path: { type: 'string', minLength: 1, maxLength: MAX_ACTION_PATH_LENGTH },
         operation: { type: 'string', enum: ['CREATE', 'MODIFY', 'DELETE', 'READ'] },
         intent: { type: 'string', enum: ['MUTATE', 'NOOP', 'UNKNOWN'] },
-        description: { type: 'string', maxLength: 500 },
+        description: { type: 'string', maxLength: MAX_ACTION_DESCRIPTION_LENGTH },
         content: { type: 'string' },
         contentHash: { type: 'string', pattern: '^[a-fA-F0-9]{64}$' },
       },
@@ -99,15 +117,15 @@ export const EXTERNAL_AGENT_ACTION_SCHEMA = {
       additionalProperties: false,
       required: ['actions'],
       properties: {
-        request: { type: 'string', maxLength: 500 },
-        summary: { type: 'string', maxLength: 500 },
+        request: { type: 'string', maxLength: MAX_ENVELOPE_TEXT_LENGTH },
+        summary: { type: 'string', maxLength: MAX_ENVELOPE_TEXT_LENGTH },
         agent: { $ref: '#/$defs/agent' },
         metadata: { type: 'object' },
         contract: { $ref: '#/$defs/contract' },
         actions: {
           type: 'array',
           minItems: 1,
-          maxItems: 500,
+          maxItems: MAX_EXTERNAL_AGENT_ACTIONS,
           items: { $ref: '#/$defs/action' },
         },
       },
@@ -117,8 +135,8 @@ export const EXTERNAL_AGENT_ACTION_SCHEMA = {
       additionalProperties: false,
       anyOf: [{ required: ['output'] }, { required: ['text'] }],
       properties: {
-        request: { type: 'string', maxLength: 500 },
-        summary: { type: 'string', maxLength: 500 },
+        request: { type: 'string', maxLength: MAX_ENVELOPE_TEXT_LENGTH },
+        summary: { type: 'string', maxLength: MAX_ENVELOPE_TEXT_LENGTH },
         agent: { $ref: '#/$defs/agent' },
         metadata: { type: 'object' },
         contract: { $ref: '#/$defs/contract' },
@@ -129,7 +147,7 @@ export const EXTERNAL_AGENT_ACTION_SCHEMA = {
     actionArray: {
       type: 'array',
       minItems: 1,
-      maxItems: 500,
+      maxItems: MAX_EXTERNAL_AGENT_ACTIONS,
       items: { $ref: '#/$defs/action' },
     },
   },
@@ -155,13 +173,9 @@ export function parseExternalAgentEnvelope(rawInput: string): ExternalAgentActio
   const trimmed = rawInput.trim();
 
   // Raw FILE_ACTION text also begins with '[', so it must be detected BEFORE
-  // the JSON branch — otherwise JSON.parse throws on valid FILE_ACTION blocks
-  // and the legacy text protocol (the model-free BYOA pipe) is unreachable.
+  // the JSON branch — otherwise JSON.parse throws on valid FILE_ACTION blocks.
   if (trimmed.startsWith('[FILE_ACTION')) {
-    return {
-      format: 'file-action-text',
-      actions: parseActions(rawInput),
-    };
+    return normalizeTextActions(rawInput);
   }
 
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
@@ -174,9 +188,11 @@ export function parseExternalAgentEnvelope(rawInput: string): ExternalAgentActio
     }
 
     if (Array.isArray(parsed)) {
+      const actions = parsed.map(normalizeJsonAction);
+      assertActionCount(actions);
       return {
         format: 'json-action-array',
-        actions: parsed.map(normalizeJsonAction),
+        actions,
       };
     }
 
@@ -187,10 +203,7 @@ export function parseExternalAgentEnvelope(rawInput: string): ExternalAgentActio
     return normalizeJsonEnvelope(parsed);
   }
 
-  return {
-    format: 'file-action-text',
-    actions: parseActions(rawInput),
-  };
+  return normalizeTextActions(rawInput);
 }
 
 export function validateExternalAgentInput(rawInput: string): ExternalAgentValidation {
@@ -198,10 +211,6 @@ export function validateExternalAgentInput(rawInput: string): ExternalAgentValid
     const parsed = parseExternalAgentEnvelope(rawInput);
     const warnings: string[] = [];
     const errors: string[] = [];
-
-    if (parsed.actions.length === 0) {
-      errors.push('No valid file actions were found.');
-    }
 
     const contract = parsed.contract
       ? validateTaskContractForActions(parsed.actions, parsed.contract)
@@ -288,80 +297,103 @@ export function validateTaskContractForActions(actions: FileAction[], contract?:
 }
 
 function normalizeJsonEnvelope(obj: Record<string, unknown>): ExternalAgentActionEnvelope {
-  const allowedKeys = new Set(['request', 'summary', 'agent', 'metadata', 'contract', 'actions', 'output', 'text']);
-  for (const key of Object.keys(obj)) {
-    if (!allowedKeys.has(key)) {
-      throw new Error(`Unknown external-agent envelope key: ${key}`);
+  const hasActions = Object.prototype.hasOwnProperty.call(obj, 'actions');
+  const hasOutput = Object.prototype.hasOwnProperty.call(obj, 'output');
+  const hasText = Object.prototype.hasOwnProperty.call(obj, 'text');
+
+  if (hasActions) {
+    assertKnownProperties(obj, ACTION_ENVELOPE_KEYS, 'external-agent envelope');
+    if (!Array.isArray(obj.actions)) {
+      throw new Error('Invalid JSON input: actions must be an array.');
     }
+    if (hasOutput || hasText) {
+      throw new Error('Invalid JSON input: an actions envelope cannot also contain output or text.');
+    }
+
+    const actions = obj.actions.map(normalizeJsonAction);
+    assertActionCount(actions);
+    return {
+      format: 'json-envelope',
+      actions,
+      ...normalizeCommonEnvelopeFields(obj),
+    };
   }
 
-  if (!Array.isArray(obj.actions)) {
-    if (typeof obj.output === 'string' || typeof obj.text === 'string') {
-      const text = typeof obj.output === 'string' ? obj.output : obj.text as string;
-      const agent = isRecord(obj.agent) ? obj.agent : undefined;
-      // Preserve and validate the contract here too — dropping it would let an
-      // agent declare a per-run boundary that is then silently not enforced.
-      const contract = obj.contract === undefined ? undefined : normalizeTaskContract(obj.contract);
-      return {
-        format: 'file-action-text',
-        actions: parseActions(text),
-        request: optionalString(obj.request),
-        summary: optionalString(obj.summary),
-        agent: {
-          id: optionalString(agent?.id),
-          model: optionalString(agent?.model),
-        },
-        metadata: isRecord(obj.metadata) ? obj.metadata : undefined,
-        ...(contract ? { contract } : {}),
-      };
-    }
-
+  assertKnownProperties(obj, TEXT_ENVELOPE_KEYS, 'external-agent envelope');
+  if (!hasOutput && !hasText) {
     throw new Error('Invalid JSON input: expected { actions: [...] }, { output: "..." }, or an action array.');
   }
+  if (hasOutput && typeof obj.output !== 'string') {
+    throw new Error('Invalid external-agent envelope output: must be a string.');
+  }
+  if (hasText && typeof obj.text !== 'string') {
+    throw new Error('Invalid external-agent envelope text: must be a string.');
+  }
 
-  const agent = isRecord(obj.agent) ? obj.agent : undefined;
+  const text = typeof obj.output === 'string' ? obj.output : obj.text as string;
+  const parsed = normalizeTextActions(text);
+  return {
+    ...parsed,
+    ...normalizeCommonEnvelopeFields(obj),
+  };
+}
+
+function normalizeCommonEnvelopeFields(obj: Record<string, unknown>): Omit<ExternalAgentActionEnvelope, 'actions' | 'format'> {
+  const request = optionalBoundedString(obj.request, 'request', MAX_ENVELOPE_TEXT_LENGTH);
+  const summary = optionalBoundedString(obj.summary, 'summary', MAX_ENVELOPE_TEXT_LENGTH);
+  const agent = normalizeAgent(obj.agent);
+  const metadata = normalizeMetadata(obj.metadata);
   const contract = obj.contract === undefined ? undefined : normalizeTaskContract(obj.contract);
 
   return {
-    format: 'json-envelope',
-    actions: obj.actions.map(normalizeJsonAction),
-    request: optionalString(obj.request),
-    summary: optionalString(obj.summary),
-    agent: {
-      id: optionalString(agent?.id),
-      model: optionalString(agent?.model),
-    },
-    metadata: isRecord(obj.metadata) ? obj.metadata : undefined,
-    ...(contract ? { contract } : {}),
+    ...(request !== undefined ? { request } : {}),
+    ...(summary !== undefined ? { summary } : {}),
+    ...(agent !== undefined ? { agent } : {}),
+    ...(metadata !== undefined ? { metadata } : {}),
+    ...(contract !== undefined ? { contract } : {}),
   };
+}
+
+function normalizeAgent(value: unknown): ExternalAgentActionEnvelope['agent'] | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new Error('agent must be an object.');
+  assertKnownProperties(value, AGENT_KEYS, 'agent');
+
+  const id = optionalBoundedString(value.id, 'agent.id', MAX_AGENT_ID_LENGTH);
+  const model = optionalBoundedString(value.model, 'agent.model', MAX_AGENT_MODEL_LENGTH);
+  return {
+    ...(id !== undefined ? { id } : {}),
+    ...(model !== undefined ? { model } : {}),
+  };
+}
+
+function normalizeMetadata(value: unknown): Record<string, unknown> | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new Error('metadata must be an object.');
+  return value;
 }
 
 function normalizeJsonAction(value: unknown): FileAction {
   if (!isRecord(value)) {
     throw new Error('Invalid action: expected an object.');
   }
+  assertKnownProperties(value, ACTION_KEYS, 'action');
 
-  const allowedKeys = new Set(['path', 'operation', 'intent', 'description', 'content', 'contentHash']);
-  for (const key of Object.keys(value)) {
-    if (!allowedKeys.has(key)) {
-      throw new Error(`Unknown action key: ${key}`);
-    }
+  const operation = requireEnumString(value.operation, 'action operation', VALID_OPERATIONS);
+  if (typeof value.path === 'string' && value.path.length > MAX_ACTION_PATH_LENGTH) {
+    throw new Error(`Invalid action path: exceeds ${MAX_ACTION_PATH_LENGTH} characters.`);
   }
-
-  const operation = normalizeOperation(value.operation);
-  if (!operation) {
-    throw new Error(`Invalid action operation: ${String(value.operation)}`);
-  }
-
-  const path = assertSafeRelativePath(value.path);
-  const description = typeof value.description === 'string' && value.description.trim().length > 0
-    ? value.description.trim()
-    : `${operation} ${path}`;
+  const path = assertSafeRelativePathShape(value.path, 'action path', { maxLength: MAX_ACTION_PATH_LENGTH });
+  const description = optionalBoundedString(value.description, `action description for ${path}`, MAX_ACTION_DESCRIPTION_LENGTH)
+    ?? `${operation} ${path}`;
+  const intent = value.intent === undefined
+    ? (operation === 'READ' ? 'NOOP' : 'MUTATE')
+    : requireEnumString(value.intent, `action intent for ${path}`, VALID_INTENTS);
 
   const action: FileAction = {
     path,
     operation,
-    intent: normalizeIntent(value.intent, operation),
+    intent,
     description,
   };
 
@@ -373,45 +405,64 @@ function normalizeJsonAction(value: unknown): FileAction {
   }
 
   if (value.contentHash !== undefined) {
-    if (typeof value.contentHash !== 'string' || !/^[a-f0-9]{64}$/i.test(value.contentHash.trim())) {
+    if (typeof value.contentHash !== 'string' || !/^[a-f0-9]{64}$/i.test(value.contentHash)) {
       throw new Error(`Invalid action contentHash for ${path}: expected 64 hex characters.`);
     }
-    action.contentHash = value.contentHash.trim().toLowerCase();
+    action.contentHash = value.contentHash.toLowerCase();
   }
 
   return action;
 }
 
-function normalizeOperation(value: unknown): FileAction['operation'] | null {
-  if (typeof value !== 'string') return null;
-  const op = value.trim().toUpperCase();
-  if (!VALID_OPERATIONS.has(op as FileAction['operation'])) return null;
-  return op as FileAction['operation'];
+function normalizeTextActions(text: string): ExternalAgentActionEnvelope {
+  const actions = parseActions(text).map(validateParsedTextAction);
+  assertActionCount(actions);
+  return {
+    format: 'file-action-text',
+    actions,
+  };
 }
 
-function normalizeIntent(value: unknown, operation: FileAction['operation']): FileAction['intent'] {
-  if (typeof value === 'string') {
-    const intent = value.trim().toUpperCase();
-    if (VALID_INTENTS.has(intent as FileAction['intent'])) return intent as FileAction['intent'];
+function validateParsedTextAction(action: FileAction): FileAction {
+  const path = assertSafeRelativePathShape(action.path, 'action path', { maxLength: MAX_ACTION_PATH_LENGTH });
+  const description = action.description ?? `${action.operation} ${path}`;
+  if (description.length > MAX_ACTION_DESCRIPTION_LENGTH) {
+    throw new Error(
+      `Invalid action description for ${path}: exceeds ${MAX_ACTION_DESCRIPTION_LENGTH} characters.`,
+    );
   }
-  return operation === 'READ' ? 'NOOP' : 'MUTATE';
+  if (action.contentHash !== undefined && !/^[a-f0-9]{64}$/i.test(action.contentHash)) {
+    throw new Error(`Invalid action contentHash for ${path}: expected 64 hex characters.`);
+  }
+  return {
+    ...action,
+    path,
+    description,
+    contentHash: action.contentHash?.toLowerCase(),
+  };
 }
 
-function assertSafeRelativePath(filePath: unknown): string {
-  return assertSafeRelativePathShape(filePath, 'action path', { maxLength: MAX_PATH_LENGTH });
+function assertActionCount(actions: FileAction[]): void {
+  if (actions.length === 0) {
+    throw new Error('No valid file actions were found.');
+  }
+  if (actions.length > MAX_EXTERNAL_AGENT_ACTIONS) {
+    throw new Error(`External agent input contains ${actions.length} actions; maximum is ${MAX_EXTERNAL_AGENT_ACTIONS}.`);
+  }
+}
+
+function requireEnumString<T extends string>(value: unknown, label: string, allowed: ReadonlySet<T>): T {
+  if (typeof value !== 'string' || !allowed.has(value as T)) {
+    throw new Error(`Invalid ${label}: ${String(value)}. Expected one of: ${[...allowed].join(', ')}.`);
+  }
+  return value as T;
 }
 
 function normalizeTaskContract(value: unknown): TaskContract {
   if (!isRecord(value)) {
     throw new Error('contract must be an object.');
   }
-
-  const allowedKeys = new Set(['allowedPaths', 'blockedPaths', 'requiredPaths', 'expectedOutputs']);
-  for (const key of Object.keys(value)) {
-    if (!allowedKeys.has(key)) {
-      throw new Error(`Unknown task contract key: ${key}`);
-    }
-  }
+  assertKnownProperties(value, CONTRACT_KEYS, 'task contract');
 
   return {
     allowedPaths: optionalPatternList(value.allowedPaths, 'contract.allowedPaths'),
@@ -450,6 +501,10 @@ function validatePatternList(value: unknown, name: string): string[] {
       errors.push(`${name} entries must be non-empty strings.`);
       continue;
     }
+    if (pattern.length > MAX_CONTRACT_PATTERN_LENGTH) {
+      errors.push(`${name} contains an unsafe pattern: ${pattern}`);
+      continue;
+    }
     const normalized = normalizeRelativePath(pattern);
     if (!isSafeRelativePathShape(normalized, { maxLength: MAX_CONTRACT_PATTERN_LENGTH })) {
       errors.push(`${name} contains an unsafe pattern: ${pattern}`);
@@ -462,8 +517,10 @@ function normalizedPatternList(patterns?: string[]): string[] {
   return (patterns ?? []).map((pattern) => normalizePolicyPath(pattern)).filter(Boolean);
 }
 
-function optionalString(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined;
+function optionalBoundedString(value: unknown, label: string, maxLength: number): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string') throw new Error(`${label} must be a string.`);
+  if (value.length > maxLength) throw new Error(`${label} exceeds ${maxLength} characters.`);
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
 }

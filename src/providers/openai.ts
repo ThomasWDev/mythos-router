@@ -15,6 +15,8 @@ import {
   extractOpenAIToolCalls,
   OpenAIToolCallAccumulator,
 } from './tools.js';
+import { normalizeProviderError } from './errors.js';
+import { messagesCharLength, normalizeMessages } from './messages.js';
 
 // ── Provider Configuration ───────────────────────────────────
 export interface OpenAIProviderConfig {
@@ -89,8 +91,62 @@ export class OpenAIProvider implements BaseProvider {
   private buildChatMessages(
     messages: Message[],
     systemPrompt?: string,
-  ): Array<{ role: string; content: string }> {
-    const turns = messages.map(m => ({ role: m.role, content: m.content }));
+  ): Array<Record<string, unknown>> {
+    const turns: Array<Record<string, unknown>> = [];
+
+    for (const message of normalizeMessages(messages)) {
+      if (typeof message.content === 'string') {
+        turns.push({ role: message.role, content: message.content });
+        continue;
+      }
+
+      if (message.role === 'assistant') {
+        const text = message.content
+          .filter((block) => block.type === 'text')
+          .map((block) => block.type === 'text' ? block.text : '')
+          .join('');
+        const toolCalls = message.content
+          .filter((block) => block.type === 'tool_call')
+          .map((block) => {
+            if (block.type !== 'tool_call') throw new Error('unreachable');
+            return {
+              id: block.id,
+              type: 'function',
+              function: {
+                name: block.name,
+                arguments: JSON.stringify(block.args),
+              },
+            };
+          });
+
+        turns.push({
+          role: 'assistant',
+          content: text.length > 0 ? text : null,
+          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+        });
+        continue;
+      }
+
+      // OpenAI represents tool results as dedicated `tool` role messages. Keep
+      // them immediately after the corresponding assistant tool-call message,
+      // then emit any ordinary user text from the same neutral message.
+      const textParts: string[] = [];
+      for (const block of message.content) {
+        if (block.type === 'tool_result') {
+          turns.push({
+            role: 'tool',
+            tool_call_id: block.toolCallId,
+            content: block.content,
+          });
+        } else if (block.type === 'text') {
+          textParts.push(block.text);
+        }
+      }
+      if (textParts.length > 0) {
+        turns.push({ role: 'user', content: textParts.join('') });
+      }
+    }
+
     const sys = systemPrompt?.trim();
     if (!sys) return turns;
     const systemRole = this.reasoningModel ? 'developer' : 'system';
@@ -211,30 +267,59 @@ export class OpenAIProvider implements BaseProvider {
 
     const body = this.buildRequestBody(messages, options, 16384, true);
 
-    const response = await fetch(`${this.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.apiKey}`,
-      },
-      body: JSON.stringify(body),
-      signal: options.signal,
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify(body),
+        signal: options.signal,
+      });
+    } catch (error) {
+      throw normalizeProviderError(error, {
+        providerId: this.id,
+        operation: 'stream request failed',
+        signal: options.signal,
+      });
+    }
 
     if (!response.ok) {
-      const errorText = await response.text().catch(() => 'Unknown error');
+      const errorText = (await response.text().catch(() => 'Unknown error')).slice(0, 4096);
+      const requestId = response.headers.get('x-request-id')
+        ?? response.headers.get('request-id')
+        ?? undefined;
       throw new ProviderError(
         `[${this.id}] API error ${response.status}: ${errorText}`,
-        { kind: kindFromStatus(response.status), status: response.status, providerId: this.id },
+        {
+          kind: kindFromStatus(response.status),
+          status: response.status,
+          providerId: this.id,
+          requestId,
+        },
       );
     }
 
     if (!response.body) {
-      throw new Error(`[${this.id}] No response body received`);
+      throw new ProviderError(`[${this.id}] No response body received`, {
+        kind: 'server_error',
+        providerId: this.id,
+      });
     }
 
-    const { thinkingText, responseText, inputTokens: parsedInputTokens, outputTokens: parsedOutputTokens, toolCalls } =
-      await this.processSSEStream(response.body.getReader(), options);
+    let streamResult: Awaited<ReturnType<OpenAIProvider['processSSEStream']>>;
+    try {
+      streamResult = await this.processSSEStream(response.body.getReader(), options);
+    } catch (error) {
+      throw normalizeProviderError(error, {
+        providerId: this.id,
+        operation: 'stream interrupted',
+        signal: options.signal,
+      });
+    }
+    const { thinkingText, responseText, inputTokens: parsedInputTokens, outputTokens: parsedOutputTokens, toolCalls } = streamResult;
 
     let inputTokens = parsedInputTokens;
     let outputTokens = parsedOutputTokens;
@@ -242,7 +327,7 @@ export class OpenAIProvider implements BaseProvider {
     // Estimate tokens if not provided by the API
     if (inputTokens === 0) {
       inputTokens = Math.ceil(
-        messages.reduce((acc, m) => acc + m.content.length, 0) / 4
+        messagesCharLength(messages) / 4
       );
     }
     if (outputTokens === 0) {
@@ -282,25 +367,42 @@ export class OpenAIProvider implements BaseProvider {
 
     const body = this.buildRequestBody(messages, options, 8192, false);
 
-    const response = await fetch(`${this.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.apiKey}`,
-      },
-      body: JSON.stringify(body),
-      signal: options.signal,
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify(body),
+        signal: options.signal,
+      });
+    } catch (error) {
+      throw normalizeProviderError(error, {
+        providerId: this.id,
+        operation: 'API request failed',
+        signal: options.signal,
+      });
+    }
 
     if (!response.ok) {
-      const errorText = await response.text().catch(() => 'Unknown error');
+      const errorText = (await response.text().catch(() => 'Unknown error')).slice(0, 4096);
+      const requestId = response.headers.get('x-request-id')
+        ?? response.headers.get('request-id')
+        ?? undefined;
       throw new ProviderError(
         `[${this.id}] API error ${response.status}: ${errorText}`,
-        { kind: kindFromStatus(response.status), status: response.status, providerId: this.id },
+        {
+          kind: kindFromStatus(response.status),
+          status: response.status,
+          providerId: this.id,
+          requestId,
+        },
       );
     }
 
-    const data = await response.json() as {
+    let data: {
       choices?: Array<{
         message?: {
           content?: string;
@@ -313,13 +415,22 @@ export class OpenAIProvider implements BaseProvider {
         completion_tokens?: number;
       };
     };
+    try {
+      data = await response.json() as typeof data;
+    } catch (error) {
+      throw new ProviderError(`[${this.id}] API returned invalid JSON`, {
+        kind: 'server_error',
+        providerId: this.id,
+        cause: error,
+      });
+    }
 
     const choice = data.choices?.[0]?.message;
     const thinkingText = choice?.reasoning_content ?? '';
     const responseText = choice?.content ?? '';
     const toolCalls: UnifiedToolCall[] = extractOpenAIToolCalls(choice);
     const inputTokens = data.usage?.prompt_tokens ?? Math.ceil(
-      messages.reduce((acc, m) => acc + m.content.length, 0) / 4
+      messagesCharLength(messages) / 4
     );
     const outputTokens = data.usage?.completion_tokens ?? Math.ceil(
       (responseText.length + thinkingText.length) / 4
@@ -338,7 +449,10 @@ export class OpenAIProvider implements BaseProvider {
         providerId: this.id,
         modelId: model,
         fallbackTriggered: false,
-        incomplete: responseText.trim().length === 0 && thinkingText.trim().length === 0,
+        incomplete:
+          responseText.trim().length === 0 &&
+          thinkingText.trim().length === 0 &&
+          toolCalls.length === 0,
       },
     };
   }

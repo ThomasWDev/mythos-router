@@ -219,6 +219,7 @@ mythos chat                  # Full power (high effort, Opus 4.8)
 mythos chat -s repo          # Load a project-local skill pack
 mythos chat --test-cmd "npm test" # Enable autonomous test-driven self-healing
 mythos chat --provider openai # Force a configured BYOK provider
+mythos chat --tools          # Opt in to native provider tool-calling
 mythos chat --effort low     # Budget mode (Haiku 4.5 when using Claude)
 mythos chat --effort medium  # Balanced (Sonnet 4.6 when using Claude)
 mythos chat --resume         # Resume your previous session exactly where you left off
@@ -334,6 +335,8 @@ CONTENT:
 
 Security defaults:
 - input is size-limited and schema-validated before execution
+- JSON action batches contain 1–500 actions; `operation` and `intent` values are uppercase and case-sensitive
+- unknown or misspelled envelope, agent, contract, and action fields are rejected instead of ignored
 - external JSON paths must be safe project-relative paths
 - `.env`, private keys, wallet files, `.git`, `.npmrc`, and secrets paths are blocked
 - deletes and command-surface files require `--allow-risky`
@@ -364,7 +367,9 @@ Security defaults:
 }
 ```
 
-Project policy is an enforced SWD guardrail, not a prompt hint. Its block/confirm/limit rules apply to `chat`, `run`, `swd apply`, and MCP `swd_apply`. Built-in sensitive path protection still wins, so policy files cannot allow `.env`, private keys, wallet files, `.git`, or `.npmrc`. `block` patterns fail closed, `confirm` patterns require human approval or explicit `--allow-risky` in external-agent flows, and malformed policy files block writes until fixed.
+Project policy is an enforced SWD guardrail, not a prompt hint. Its block/confirm/limit rules apply to `chat`, `run`, `swd apply`, and MCP `swd_apply`. Built-in sensitive path protection still wins, so policy files cannot allow `.env`, private keys, wallet files, `.git`, or `.npmrc`. `block` patterns fail closed, `confirm` patterns require human approval or explicit `--allow-risky` in external-agent flows, and malformed policy files block writes until fixed. Policy validation is strict at every level: unknown top-level, `limits`, or check fields are rejected with typo suggestions rather than silently ignored.
+
+Published JSON Schemas are available from the package as `mythos-router/schema` for external-agent actions and `mythos-router/policy-schema` for `.mythos/policy.json`. The same limits are enforced by the runtime, and tests keep the checked-in schemas synchronized with their runtime definitions.
 
 Policy `checks` are different from path rules: declaring them does not execute anything. They run only when `mythos swd apply --run-checks` is passed, or when an MCP client calls `swd_apply` with `runChecks: true`. Checks run in the same isolated temp repo copy as ad-hoc `--check` commands, and failed checks prevent writes from reaching the real working tree.
 
@@ -581,7 +586,8 @@ mythos-router/
 │       └── stats.ts     # Budget analytics reporter
 ├── src/providers/       # Multi-Provider Orchestration Engine
 │   ├── orchestrator.ts  # Adaptive routing, circuit breakers, scoring
-│   ├── pricing.ts       # Centralized token cost registry
+│   ├── pricing.ts       # Total + normalized token cost estimates
+│   ├── errors.ts        # Typed provider error normalization
 │   ├── types.ts         # Unified BaseProvider contracts
 │   ├── anthropic.ts     # Claude provider
 │   └── openai.ts        # Fetch-based OpenAI & DeepSeek provider
@@ -615,13 +621,20 @@ User Input
                 └── Still failing → Yield to human
 ```
 
-### Why text-based `FILE_ACTION` blocks instead of native tool-calling?
+### Text `FILE_ACTION` protocol and native tool-calling
 
-This is a deliberate design choice, not a missing feature. Mythos asks the model to emit file operations as plain-text `[FILE_ACTION]` blocks (parsed by `parseActions` in `swd.ts`) rather than using a provider's native function/tool-calling API. The tradeoffs:
+Mythos keeps plain-text `[FILE_ACTION]` blocks as the default because they remain provider-agnostic and work with any model backend. Native Anthropic/OpenAI-compatible tool-calling is available as an opt-in transport with `--tools`. Both paths feed the same SWD validation, path jail, atomic writer, verification, rollback, and receipt pipeline; enabling tools does not grant the model any additional filesystem authority.
 
-- **Provider-agnostic by construction.** The exact same protocol works across Anthropic, OpenAI, and DeepSeek — and any future model, including ones with no tool-calling API at all. There is no per-provider tool plumbing to maintain, which is what lets BYOK fallback route a single conversation across heterogeneous providers.
-- **It is the right fit for SWD.** The model only ever *claims* an operation; the claim is then verified against the real filesystem with SHA-256 snapshots and rolled back on mismatch. The trust boundary is the filesystem, not the model's output format, so a structured tool-call would buy little over a parsed text block here.
-- **Honest about the limits.** Text parsing is more fragile than schema-enforced JSON tool calls — a malformed block is dropped (and surfaced as a warning) rather than executed, and provider-side guarantees like enforced argument schemas or parallel tool calls are not used. Provider `capabilities` therefore describe only `thinking`/`streaming`; native tool-calling is intentionally not modeled.
+Native tool conversations are stored in a provider-neutral structured history:
+
+- assistant text and `tool_call` blocks are preserved together;
+- every tool call receives a matching `tool_result`, including blocked, malformed, failed, and rolled-back writes;
+- Anthropic histories are replayed as `tool_use` / `tool_result` blocks;
+- OpenAI-compatible histories are replayed as assistant `tool_calls` followed by `tool` role messages;
+- tool-only assistant turns are never serialized as empty messages; and
+- provider fallback, SWD correction turns, test-healing turns, and `chat --resume` retain the complete tool exchange.
+
+The text protocol remains the compatibility fallback if a selected model ignores the tool definition and emits `[FILE_ACTION]` output instead.
 
 ---
 
@@ -638,8 +651,16 @@ This is a deliberate design choice, not a missing feature. Mythos asks the model
 
 \* `mythos chat` and `mythos run` need at least one model provider key. `mythos swd apply` needs no model key because an external agent brings its own model/key and Mythos only verifies file actions.
 
+### Provider routing guarantees
+
+- `ProviderConfig.maxConcurrency` is a **hard in-flight limit**. When every eligible provider is saturated, requests wait for capacity instead of exceeding the configured cap. An aborted queued request is removed without calling a provider.
+- Forced and deterministic routing do not silently change providers under load. They wait for the selected provider's capacity slot.
+- `OrchestrationEvent.retryCount` counts same-provider retries only. `fallbackCount` counts provider transitions, and `fallbackReason` preserves the actual triggering reason such as `rate_limit`, `overloaded`, `timeout`, or `network_error`.
+- `cost` is the estimated total USD cost of that request. `costPer1k` is the blended estimated USD per 1,000 processed tokens and is the normalized value used by adaptive routing, so larger requests are not penalized merely for containing more tokens.
+- Provider adapters throw `ProviderError` with structured `kind`, `status`, `providerId`, optional request ID/provider code, retryability, and the original error as `cause`.
+
 | File | Purpose |
-|------|---------| 
+|------|---------|
 | `.mythosignore` | Patterns to exclude from SWD scanning |
 | `.mythos/policy.json` | Enforced repo-local SWD safety policy |
 | `.mythos/skills/` | Optional project-local skill packs that can be committed with a repo |
@@ -693,7 +714,7 @@ When the budget is reached, mythos doesn't just kill your session — it perform
   Disable limits:  mythos chat --no-budget
 ```
 
-The system automatically saves your conversation history and budget state to `~/.mythos-router/sessions/latest.json`. You can instantly restore your exact context by running `mythos chat --resume`.
+The system automatically saves your conversation history and budget state to `~/.mythos-router/sessions/latest.json`. Session format v2 preserves structured assistant tool calls and tool results, while existing valid v1 text-only sessions are migrated when loaded. Malformed or incomplete tool histories are rejected rather than sent back to a provider. You can restore the saved context with `mythos chat --resume`.
 
 Token counts, estimated cost, and budget status are displayed after every chat response.
 

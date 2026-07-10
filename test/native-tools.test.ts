@@ -61,6 +61,15 @@ describe('extractAnthropicToolCalls', () => {
     assert.deepEqual(extractAnthropicToolCalls([{ type: 'text', text: 'hi' }] as never), []);
     assert.deepEqual(extractAnthropicToolCalls(undefined), []);
   });
+
+  it('synthesizes unique ids when a provider omits or duplicates them', () => {
+    const calls = extractAnthropicToolCalls([
+      { type: 'tool_use', name: 'write_files', input: {} },
+      { type: 'tool_use', id: 'same', name: 'write_files', input: {} },
+      { type: 'tool_use', id: 'same', name: 'write_files', input: {} },
+    ] as never);
+    assert.deepEqual(calls.map((call) => call.id), ['anthropic_tool_1', 'same', 'same_2']);
+  });
 });
 
 describe('extractOpenAIToolCalls', () => {
@@ -85,6 +94,17 @@ describe('extractOpenAIToolCalls', () => {
   it('returns [] when there are no tool calls', () => {
     assert.deepEqual(extractOpenAIToolCalls({}), []);
     assert.deepEqual(extractOpenAIToolCalls(undefined), []);
+  });
+
+  it('synthesizes replayable ids for id-less OpenAI-compatible calls', () => {
+    const calls = extractOpenAIToolCalls({
+      tool_calls: [
+        { function: { name: 'write_files', arguments: '{}' } },
+        { id: 'same', function: { name: 'write_files', arguments: '{}' } },
+        { id: 'same', function: { name: 'write_files', arguments: '{}' } },
+      ],
+    });
+    assert.deepEqual(calls.map((call) => call.id), ['openai_tool_1', 'same', 'same_2']);
   });
 });
 

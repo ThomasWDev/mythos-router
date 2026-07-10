@@ -2,8 +2,17 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { PROJECT_POLICY_FILE } from './config.js';
 import { MAX_WRITABLE_ACTION_CONTENT_BYTES, type FileAction } from './swd.js';
+import { isSafeRelativePathShape, normalizeRelativePath } from './path-safety.js';
+import { unknownPropertyErrors } from './object-validation.js';
 
 export const PROJECT_POLICY_VERSION = 1;
+export const PROJECT_POLICY_SCHEMA_ID = 'https://mythos-router.local/schemas/project-policy.schema.json';
+export const MAX_POLICY_PATTERNS = 200;
+export const MAX_POLICY_PATTERN_LENGTH = 240;
+export const MAX_POLICY_ACTIONS = 500;
+export const MAX_POLICY_CHECKS = 20;
+export const MAX_POLICY_CHECK_NAME_LENGTH = 60;
+export const MAX_POLICY_CHECK_COMMAND_LENGTH = 500;
 
 export type ProjectPolicyOperation = FileAction['operation'];
 
@@ -40,12 +49,65 @@ export interface ProjectPolicyDecision {
 }
 
 const VALID_OPERATIONS = new Set<ProjectPolicyOperation>(['CREATE', 'MODIFY', 'DELETE', 'READ']);
-const MAX_POLICY_PATTERNS = 200;
-const MAX_PATTERN_LENGTH = 240;
-const MAX_POLICY_ACTIONS = 500;
-const MAX_POLICY_CHECKS = 20;
-const MAX_CHECK_NAME_LENGTH = 60;
-const MAX_CHECK_COMMAND_LENGTH = 500;
+const PROJECT_POLICY_KEYS = ['version', 'block', 'confirm', 'limits', 'checks'] as const;
+const POLICY_LIMIT_KEYS = ['allowDeletes', 'maxActions', 'maxActionContentBytes', 'allowedOperations'] as const;
+const POLICY_CHECK_KEYS = ['name', 'command'] as const;
+
+export const PROJECT_POLICY_SCHEMA = {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  $id: PROJECT_POLICY_SCHEMA_ID,
+  title: 'Mythos project safety policy',
+  description: 'Fail-closed repository-local SWD policy stored at .mythos/policy.json.',
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    version: { type: 'integer', const: PROJECT_POLICY_VERSION },
+    block: { $ref: '#/$defs/pathPatterns' },
+    confirm: { $ref: '#/$defs/pathPatterns' },
+    limits: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        allowDeletes: { type: 'boolean' },
+        maxActions: { type: 'integer', minimum: 1, maximum: MAX_POLICY_ACTIONS },
+        maxActionContentBytes: {
+          type: 'integer',
+          minimum: 1,
+          maximum: MAX_WRITABLE_ACTION_CONTENT_BYTES,
+        },
+        allowedOperations: {
+          type: 'array',
+          maxItems: 4,
+          items: { type: 'string', enum: ['CREATE', 'MODIFY', 'DELETE', 'READ'] },
+        },
+      },
+    },
+    checks: {
+      type: 'array',
+      maxItems: MAX_POLICY_CHECKS,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['name', 'command'],
+        properties: {
+          name: { type: 'string', minLength: 1, maxLength: MAX_POLICY_CHECK_NAME_LENGTH },
+          command: { type: 'string', minLength: 1, maxLength: MAX_POLICY_CHECK_COMMAND_LENGTH },
+        },
+      },
+    },
+  },
+  $defs: {
+    pathPatterns: {
+      type: 'array',
+      maxItems: MAX_POLICY_PATTERNS,
+      items: {
+        type: 'string',
+        minLength: 1,
+        maxLength: MAX_POLICY_PATTERN_LENGTH,
+      },
+    },
+  },
+} as const;
 
 export const DEFAULT_PROJECT_POLICY: ProjectPolicy = {
   version: PROJECT_POLICY_VERSION,
@@ -168,12 +230,12 @@ function projectPolicyFailure(state: ProjectPolicyState): ProjectPolicyDecision 
   };
 }
 
-function validateProjectPolicy(value: unknown): string[] {
-  const errors: string[] = [];
-
+export function validateProjectPolicy(value: unknown): string[] {
   if (!isRecord(value)) {
     return [`${PROJECT_POLICY_FILE} must contain a JSON object.`];
   }
+
+  const errors = unknownPropertyErrors(value, PROJECT_POLICY_KEYS, 'project policy');
 
   if (value.version !== undefined && value.version !== PROJECT_POLICY_VERSION) {
     errors.push(`version must be ${PROJECT_POLICY_VERSION}.`);
@@ -187,6 +249,7 @@ function validateProjectPolicy(value: unknown): string[] {
     if (!isRecord(value.limits)) {
       errors.push('limits must be an object.');
     } else {
+      errors.push(...unknownPropertyErrors(value.limits, POLICY_LIMIT_KEYS, 'project policy limits'));
       errors.push(...validateLimits(value.limits));
     }
   }
@@ -205,8 +268,13 @@ function validatePatternList(value: unknown, key: 'block' | 'confirm'): string[]
       errors.push(`${key} patterns must be non-empty strings.`);
       continue;
     }
-    if (pattern.length > MAX_PATTERN_LENGTH) {
-      errors.push(`${key} pattern is too long: ${pattern.slice(0, 40)}...`);
+    if (pattern.length > MAX_POLICY_PATTERN_LENGTH) {
+      errors.push(`${key} contains an unsafe or overlong pattern: ${pattern}`);
+      continue;
+    }
+    const normalized = normalizeRelativePath(pattern);
+    if (!isSafeRelativePathShape(normalized, { maxLength: MAX_POLICY_PATTERN_LENGTH })) {
+      errors.push(`${key} contains an unsafe or overlong pattern: ${pattern}`);
     }
   }
   return errors;
@@ -224,11 +292,13 @@ function validateChecks(value: unknown): string[] {
       errors.push('each check must be an object with name and command.');
       continue;
     }
+    errors.push(...unknownPropertyErrors(entry, POLICY_CHECK_KEYS, 'project policy check'));
+
     const name = entry.name;
     const command = entry.command;
     if (typeof name !== 'string' || name.trim().length === 0) {
       errors.push('check.name must be a non-empty string.');
-    } else if (name.length > MAX_CHECK_NAME_LENGTH) {
+    } else if (name.length > MAX_POLICY_CHECK_NAME_LENGTH) {
       errors.push(`check.name is too long: ${name.slice(0, 20)}...`);
     } else if (seen.has(name.trim())) {
       errors.push(`duplicate check name: ${name.trim()}`);
@@ -237,7 +307,7 @@ function validateChecks(value: unknown): string[] {
     }
     if (typeof command !== 'string' || command.trim().length === 0) {
       errors.push('check.command must be a non-empty string.');
-    } else if (command.length > MAX_CHECK_COMMAND_LENGTH) {
+    } else if (command.length > MAX_POLICY_CHECK_COMMAND_LENGTH) {
       errors.push('check.command is too long.');
     }
   }
@@ -268,6 +338,8 @@ function validateLimits(value: Record<string, unknown>): string[] {
   if (value.allowedOperations !== undefined) {
     if (!Array.isArray(value.allowedOperations)) {
       errors.push('limits.allowedOperations must be an array.');
+    } else if (value.allowedOperations.length > VALID_OPERATIONS.size) {
+      errors.push(`limits.allowedOperations must contain ${VALID_OPERATIONS.size} operations or fewer.`);
     } else {
       for (const op of value.allowedOperations) {
         if (typeof op !== 'string' || !VALID_OPERATIONS.has(op as ProjectPolicyOperation)) {

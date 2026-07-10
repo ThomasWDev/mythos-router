@@ -11,7 +11,7 @@
 import { AnthropicProvider } from './providers/anthropic.js';
 import { OpenAIProvider } from './providers/openai.js';
 import { ProviderOrchestrator } from './providers/orchestrator.js';
-import type { UnifiedResponse } from './providers/types.js';
+import type { Message, UnifiedResponse } from './providers/types.js';
 import {
   CAPYBARA_SYSTEM_PROMPT,
   MODELS,
@@ -136,7 +136,7 @@ function toMythosResponse(unified: UnifiedResponse): MythosResponse {
 }
 
 export async function streamMessage(
-  messages: { role: 'user' | 'assistant'; content: string }[],
+  messages: Message[],
   effort: EffortLevel = 'high',
   onThinkingDelta?: (text: string) => void,
   onTextDelta?: (text: string) => void,
@@ -156,7 +156,7 @@ export async function streamMessage(
 }
 
 export async function sendMessage(
-  messages: { role: 'user' | 'assistant'; content: string }[],
+  messages: Message[],
   effort: EffortLevel = 'low',
   systemOverride?: string,
   maxTokensOverride?: number,

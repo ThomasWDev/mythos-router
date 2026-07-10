@@ -9,7 +9,15 @@ export { getClient, getOrchestrator, streamMessage, sendMessage, formatTokenUsag
 // Export the Provider Orchestration Engine
 export { ProviderOrchestrator } from './providers/orchestrator.js';
 export { AnthropicProvider } from './providers/anthropic.js';
-export { calculateCost, getModelPricing, hasKnownPricing } from './providers/pricing.js';
+export { OpenAIProvider, type OpenAIProviderConfig } from './providers/openai.js';
+export {
+  calculateCost,
+  estimateCost,
+  getModelPricing,
+  getProviderMultiplier,
+  hasKnownPricing,
+  type CostEstimate,
+} from './providers/pricing.js';
 export {
   type BaseProvider,
   type UnifiedChunk,
@@ -22,14 +30,36 @@ export {
   type ProviderCapability,
   type ProviderStatus,
   type OrchestrationEvent,
+  type ProviderFailureReason,
   ProviderError,
   isRetryableKind,
   kindFromStatus,
   type ProviderErrorKind,
   type ProviderErrorOptions,
   type ToolDefinition,
+  type MessageContentBlock,
+  type TextMessageBlock,
+  type ToolCallMessageBlock,
+  type ToolResultMessageBlock,
 } from './providers/types.js';
 export { isRetryableError } from './providers/orchestrator.js';
+export {
+  normalizeMessage,
+  normalizeMessages,
+  assistantMessageFromResponse,
+  toolResultMessage,
+  messageCharLength,
+  messagesCharLength,
+  serializeMessageForRouting,
+  adjustCompressionBoundary,
+  type ToolResultInput,
+} from './providers/messages.js';
+export {
+  extractStatusCode,
+  failureReasonFromError,
+  normalizeProviderError,
+  type NormalizeProviderErrorOptions,
+} from './providers/errors.js';
 export {
   FILE_ACTION_TOOL,
   FILE_ACTION_TOOL_NAME,
@@ -131,16 +161,26 @@ export {
 
 export {
   PROJECT_POLICY_VERSION,
+  PROJECT_POLICY_SCHEMA,
+  PROJECT_POLICY_SCHEMA_ID,
+  MAX_POLICY_PATTERNS,
+  MAX_POLICY_PATTERN_LENGTH,
+  MAX_POLICY_ACTIONS,
+  MAX_POLICY_CHECKS,
+  MAX_POLICY_CHECK_NAME_LENGTH,
+  MAX_POLICY_CHECK_COMMAND_LENGTH,
   DEFAULT_PROJECT_POLICY,
   getProjectPolicyPath,
   loadProjectPolicy,
   projectPolicyTemplate,
+  validateProjectPolicy,
   evaluateProjectPolicyAction,
   evaluateProjectPolicyBatch,
   matchesPolicyPattern,
   normalizePolicyPath,
   type ProjectPolicy,
   type ProjectPolicyLimits,
+  type ProjectPolicyCheck,
   type ProjectPolicyState,
   type ProjectPolicyDecision,
   type ProjectPolicyOperation,
@@ -151,6 +191,14 @@ export {
   EXTERNAL_AGENT_ACTION_SCHEMA_ID,
   EXTERNAL_AGENT_ACTION_SCHEMA_VERSION,
   MAX_AGENT_INPUT_BYTES,
+  MAX_EXTERNAL_AGENT_ACTIONS,
+  MAX_ACTION_PATH_LENGTH,
+  MAX_ACTION_DESCRIPTION_LENGTH,
+  MAX_ENVELOPE_TEXT_LENGTH,
+  MAX_AGENT_ID_LENGTH,
+  MAX_AGENT_MODEL_LENGTH,
+  MAX_CONTRACT_PATTERNS,
+  MAX_CONTRACT_PATTERN_LENGTH,
   parseExternalAgentEnvelope,
   validateExternalAgentInput,
   validateTaskContractForActions,
