@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { SWDEngine, parseActions, type FileAction, type SWDOptions, type SWDRunResult } from '../swd.js';
+import { SWDEngine, type FileAction, type SWDOptions, type SWDRunResult } from '../swd.js';
 import { reviewActions, type ActionRiskVerdict } from '../security-policy.js';
 import { createSWDReceipt, saveSWDReceipt, redactReceiptSecrets, type ReceiptProvider } from '../receipts.js';
 import { isGitRepo, getCurrentBranch, getLatestHash } from '../git.js';
@@ -15,7 +15,6 @@ import {
   type TaskContractValidation,
 } from '../action-schema.js';
 import { saveRunRecord } from '../runs.js';
-import { assertSafeRelativePathShape } from '../path-safety.js';
 import { c, error as logError, success as logSuccess, warn as logWarn } from '../utils.js';
 
 export interface ExternalAgentInput {
@@ -134,117 +133,6 @@ function summarizeFileActions(actions: FileAction[]): string {
   return actions.map((action) => `${action.operation}: ${action.path}`).join('; ');
 }
 
-function normalizeOperation(value: unknown): FileAction['operation'] | null {
-  if (typeof value !== 'string') return null;
-  const op = value.trim().toUpperCase();
-  if (op === 'CREATE' || op === 'MODIFY' || op === 'DELETE' || op === 'READ') return op;
-  return null;
-}
-
-function normalizeIntent(value: unknown, operation: FileAction['operation']): FileAction['intent'] {
-  if (typeof value === 'string') {
-    const intent = value.trim().toUpperCase();
-    if (intent === 'MUTATE' || intent === 'NOOP' || intent === 'UNKNOWN') return intent;
-  }
-  return operation === 'READ' ? 'NOOP' : 'MUTATE';
-}
-
-function assertSafeRelativePath(filePath: unknown): string {
-  return assertSafeRelativePathShape(filePath, 'action path', { maxLength: 500 });
-}
-
-function normalizeJsonAction(value: unknown): FileAction {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('Invalid action: expected an object.');
-  }
-
-  const raw = value as Record<string, unknown>;
-  const operation = normalizeOperation(raw.operation);
-  if (!operation) {
-    throw new Error(`Invalid action operation: ${String(raw.operation)}`);
-  }
-
-  const path = assertSafeRelativePath(raw.path);
-  const description = typeof raw.description === 'string' && raw.description.trim().length > 0
-    ? raw.description.trim()
-    : `${operation} ${path}`;
-
-  const action: FileAction = {
-    path,
-    operation,
-    intent: normalizeIntent(raw.intent, operation),
-    description,
-  };
-
-  if (raw.content !== undefined) {
-    if (typeof raw.content !== 'string') {
-      throw new Error(`Invalid action content for ${path}: content must be a string.`);
-    }
-    action.content = raw.content;
-  }
-
-  if (raw.contentHash !== undefined) {
-    if (typeof raw.contentHash !== 'string' || !/^[a-f0-9]{64}$/i.test(raw.contentHash.trim())) {
-      throw new Error(`Invalid action contentHash for ${path}: expected 64 hex characters.`);
-    }
-    action.contentHash = raw.contentHash.trim().toLowerCase();
-  }
-
-  return action;
-}
-
-function parseJsonAgentInput(rawInput: string): ExternalAgentInput | null {
-  const trimmed = rawInput.trim();
-  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return null;
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch {
-    return null;
-  }
-
-  if (Array.isArray(parsed)) {
-    return { actions: parsed.map(normalizeJsonAction) };
-  }
-
-  if (!parsed || typeof parsed !== 'object') {
-    throw new Error('Invalid JSON input: expected an object or action array.');
-  }
-
-  const obj = parsed as Record<string, unknown>;
-
-  if (Array.isArray(obj.actions)) {
-    const agent = obj.agent && typeof obj.agent === 'object' && !Array.isArray(obj.agent)
-      ? obj.agent as Record<string, unknown>
-      : undefined;
-
-    return {
-      actions: obj.actions.map(normalizeJsonAction),
-      request: typeof obj.request === 'string' ? obj.request : undefined,
-      summary: typeof obj.summary === 'string' ? obj.summary : undefined,
-      agent: {
-        id: typeof agent?.id === 'string' ? agent.id : undefined,
-        model: typeof agent?.model === 'string' ? agent.model : undefined,
-      },
-      metadata: obj.metadata && typeof obj.metadata === 'object' && !Array.isArray(obj.metadata)
-        ? obj.metadata as Record<string, unknown>
-        : undefined,
-    };
-  }
-
-  if (typeof obj.output === 'string' || typeof obj.text === 'string') {
-    const text = typeof obj.output === 'string' ? obj.output : obj.text as string;
-    return {
-      actions: parseActions(text),
-      request: typeof obj.request === 'string' ? obj.request : undefined,
-      summary: typeof obj.summary === 'string' ? obj.summary : undefined,
-    };
-  }
-
-  throw new Error('Invalid JSON input: expected { actions: [...] }, { output: "..." }, or an action array.');
-}
-
 export function parseExternalAgentInput(rawInput: string): ExternalAgentInput {
   const parsed = parseExternalAgentEnvelope(rawInput);
   return {
@@ -324,6 +212,8 @@ export async function applyExternalAgentActions(options: ApplyExternalAgentOptio
         results: [],
         rolledBack: false,
         rollbackErrors: [],
+        rollbackStatus: 'not-needed',
+        recoveryRequired: false,
         errors: contractSummary.errors,
       },
       agent: { id: agentId, model: modelId },
@@ -346,6 +236,8 @@ export async function applyExternalAgentActions(options: ApplyExternalAgentOptio
         results: [],
         rolledBack: false,
         rollbackErrors: [],
+        rollbackStatus: 'not-needed',
+        recoveryRequired: false,
         errors: review.blocked.map(({ verdict }) => verdict.reason),
       },
       agent: { id: agentId, model: modelId },
@@ -364,6 +256,8 @@ export async function applyExternalAgentActions(options: ApplyExternalAgentOptio
         results: [],
         rolledBack: false,
         rollbackErrors: [],
+        rollbackStatus: 'not-needed',
+        recoveryRequired: false,
         errors: review.needsConfirmation.map(({ verdict }) => verdict.reason),
       },
       agent: { id: agentId, model: modelId },
@@ -411,6 +305,8 @@ export async function applyExternalAgentActions(options: ApplyExternalAgentOptio
           results: [],
           rolledBack: false,
           rollbackErrors: [],
+          rollbackStatus: 'not-needed',
+          recoveryRequired: false,
           errors: failureMessages.length > 0 ? failureMessages : ['Sandbox checks did not pass.'],
         },
         agent: { id: agentId, model: modelId },

@@ -77,16 +77,35 @@ type AnthropicContentBlock =
   | { type: 'tool_use'; id?: string; name?: string; input?: unknown }
   | { type: string; [k: string]: unknown };
 
+function uniqueToolCallId(raw: unknown, prefix: string, index: number, used: Set<string>): string {
+  const preferred = typeof raw === 'string' && raw.trim().length > 0
+    ? raw
+    : `${prefix}_${index + 1}`;
+  if (!used.has(preferred)) {
+    used.add(preferred);
+    return preferred;
+  }
+  let suffix = 2;
+  while (used.has(`${preferred}_${suffix}`)) suffix++;
+  const unique = `${preferred}_${suffix}`;
+  used.add(unique);
+  return unique;
+}
+
 export function extractAnthropicToolCalls(content: readonly AnthropicContentBlock[] | undefined): UnifiedToolCall[] {
   if (!Array.isArray(content)) return [];
   const calls: UnifiedToolCall[] = [];
+  const usedIds = new Set<string>();
   for (const block of content) {
     if (block && block.type === 'tool_use') {
       const b = block as { id?: string; name?: string; input?: unknown };
+      if (typeof b.name !== 'string' || b.name.trim().length === 0) continue;
       calls.push({
-        id: typeof b.id === 'string' ? b.id : '',
-        name: typeof b.name === 'string' ? b.name : '',
-        args: (b.input && typeof b.input === 'object') ? (b.input as Record<string, unknown>) : {},
+        id: uniqueToolCallId(b.id, 'anthropic_tool', calls.length, usedIds),
+        name: b.name,
+        args: (b.input && typeof b.input === 'object' && !Array.isArray(b.input))
+          ? (b.input as Record<string, unknown>)
+          : {},
       });
     }
   }
@@ -103,8 +122,9 @@ export function extractOpenAIToolCalls(message: { tool_calls?: OpenAIToolCall[] 
   const raw = message?.tool_calls;
   if (!Array.isArray(raw)) return [];
   const calls: UnifiedToolCall[] = [];
+  const usedIds = new Set<string>();
   for (const call of raw) {
-    if (call?.function?.name === undefined) continue;
+    if (typeof call?.function?.name !== 'string' || call.function.name.trim().length === 0) continue;
     let args: Record<string, unknown> = {};
     const argStr = call.function?.arguments;
     if (typeof argStr === 'string' && argStr.trim()) {
@@ -117,8 +137,8 @@ export function extractOpenAIToolCalls(message: { tool_calls?: OpenAIToolCall[] 
       }
     }
     calls.push({
-      id: typeof call.id === 'string' ? call.id : '',
-      name: call.function?.name ?? '',
+      id: uniqueToolCallId(call.id, 'openai_tool', calls.length, usedIds),
+      name: call.function.name,
       args,
     });
   }
@@ -157,7 +177,8 @@ export class OpenAIToolCallAccumulator {
 
   finalize(): UnifiedToolCall[] {
     const out: UnifiedToolCall[] = [];
-    for (const [, v] of [...this.byIndex.entries()].sort((a, b) => a[0] - b[0])) {
+    const usedIds = new Set<string>();
+    for (const [index, v] of [...this.byIndex.entries()].sort((a, b) => a[0] - b[0])) {
       if (!v.name) continue;
       let args: Record<string, unknown> = {};
       if (v.args.trim()) {
@@ -168,7 +189,7 @@ export class OpenAIToolCallAccumulator {
           args = {};
         }
       }
-      out.push({ id: v.id, name: v.name, args });
+      out.push({ id: uniqueToolCallId(v.id, 'openai_stream_tool', index, usedIds), name: v.name, args });
     }
     return out;
   }

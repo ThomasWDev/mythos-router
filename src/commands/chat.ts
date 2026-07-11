@@ -3,8 +3,9 @@ import * as path from 'node:path';
 import { readFileSync } from 'node:fs';
 import { formatTokenUsage, getOrchestrator, type Message } from '../client.js';
 import { SWDEngine, parseActions, summarizeActions, snapshotFile, resolveSafePath, type SWDRunResult, type FileAction } from '../swd.js';
-import { FILE_ACTION_TOOL, toolCallsToActions } from '../providers/tools.js';
+import { FILE_ACTION_TOOL, FILE_ACTION_TOOL_NAME, toolCallsToActions } from '../providers/tools.js';
 import type { UnifiedResponse } from '../providers/types.js';
+import { adjustCompressionBoundary, assistantMessageFromResponse, messageCharLength, toolResultMessage } from '../providers/messages.js';
 import { printSWDResults, dryRunSWD, printVerboseParse } from '../swd-cli.js';
 import { saveSessionMetric } from '../metrics.js';
 import { appendEntry, appendMetadataBlock, needsDream, getMemoryContext, printMemoryStatus, getEntryCount } from '../memory.js';
@@ -71,7 +72,7 @@ function getReceiptGitContext(): { branch?: string; commit?: string } | undefine
 
 
 // ── Chat Session Manager ─────────────────────────────────────
-class ChatSession {
+export class ChatSession {
   public history: Message[] = [];
   public budget: SessionBudget;
   public engine: SWDEngine;
@@ -210,7 +211,7 @@ class ChatSession {
 
   private async enforceContextWindowGuard(): Promise<void> {
     const plan = planContextCompression(
-      this.history.map((m) => m.content.length),
+      this.history.map(messageCharLength),
       this.finalSystemPrompt?.length ?? 0,
       this.charsPerToken,
       isCalibrated(this.tokenCalibrationSamples),
@@ -219,11 +220,13 @@ class ChatSession {
     if (!plan) return;
 
     const { messagesToCompress, reason } = plan;
+    const safeBoundary = adjustCompressionBoundary(this.history, messagesToCompress);
+    if (safeBoundary < 2) return;
 
-    const toCompress = this.history.slice(0, messagesToCompress);
-    const toKeep = this.history.slice(messagesToCompress);
+    const toCompress = this.history.slice(0, safeBoundary);
+    const toKeep = this.history.slice(safeBoundary);
 
-    this.ui.warn(`\n${c.yellow}Context approaching ${reason}. Compressing oldest ${messagesToCompress} turns...${c.reset}`);
+    this.ui.warn(`\n${c.yellow}Context approaching ${reason}. Compressing oldest ${safeBoundary} turns...${c.reset}`);
 
     const prompt = `Please summarize the following older conversation context into a dense, factual summary. Preserve all technical decisions, constraints, paths, and context needed to continue the work.\n\n<history>\n${JSON.stringify(toCompress, null, 2)}\n</history>`;
 
@@ -248,11 +251,11 @@ class ChatSession {
         ...toKeep
       ];
 
-      appendEntry('Context Compression', `Summarized ${messagesToCompress} turns to prevent context overflow.`, this.options.dryRun);
+      appendEntry('Context Compression', `Summarized ${safeBoundary} turns to prevent context overflow.`, this.options.dryRun);
     } catch (err: any) {
       this.ui.warn(`\n${c.red}Summarization failed (${err.message}). Falling back to hard truncation.${c.reset}`);
       this.history = toKeep;
-      appendEntry('Context Compression', `Hard truncation of ${messagesToCompress} turns due to summary failure.`, this.options.dryRun);
+      appendEntry('Context Compression', `Hard truncation of ${safeBoundary} turns due to summary failure.`, this.options.dryRun);
     }
   }
 
@@ -264,6 +267,8 @@ class ChatSession {
 
     await this.enforceContextWindowGuard();
 
+    const turnHistoryStart = this.history.length;
+    let assistantRecorded = false;
     this.history.push({ role: 'user', content: input });
     this.ui.startLoading('Capybara is thinking...');
 
@@ -271,7 +276,7 @@ class ChatSession {
     // with the provider's reported input tokens below, this is the ground-truth
     // tokenizer density used to calibrate the context-window guard.
     const requestChars = (this.finalSystemPrompt?.length ?? 0)
-      + this.history.reduce((sum, m) => sum + m.content.length, 0);
+      + this.history.reduce((sum, message) => sum + messageCharLength(message), 0);
 
     let thinkingTokens = 0;
     let streamStarted = false;
@@ -311,7 +316,8 @@ class ChatSession {
       if (!process.stdout.isTTY && response.text.trim().length > 0) {
         this.ui.write(response.text + '\n');
       }
-      this.history.push({ role: 'assistant', content: response.text });
+      this.appendAssistantResponse(response);
+      assistantRecorded = true;
       this.budget.record(response.usage.inputTokens, response.usage.outputTokens, response.metadata.modelId, response.metadata.providerId);
       // Calibrate the context-window guard from this turn's real token usage.
       this.calibrateTokenEstimate(requestChars, response.usage.inputTokens);
@@ -355,7 +361,7 @@ class ChatSession {
     } catch (err: any) {
       this.ui.stopLoading();
       this.ui.error(`API Error: ${err.message}`);
-      this.history.pop();
+      if (!assistantRecorded) this.history.splice(turnHistoryStart);
       return false;
     }
   }
@@ -408,6 +414,59 @@ class ChatSession {
     return this.useNativeTools ? [FILE_ACTION_TOOL] : undefined;
   }
 
+  private appendAssistantResponse(response: UnifiedResponse): void {
+    const message = assistantMessageFromResponse(response.text, response.toolCalls);
+    if (message) this.history.push(message);
+  }
+
+  private appendToolResults(
+    response: UnifiedResponse,
+    report: Record<string, unknown>,
+    isError: boolean,
+  ): void {
+    if (!this.useNativeTools || response.toolCalls.length === 0) return;
+
+    const results = response.toolCalls.map((call) => {
+      if (call.name !== FILE_ACTION_TOOL_NAME) {
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({
+            ok: false,
+            status: 'unsupported-tool',
+            message: `Tool ${call.name} is not available in this session.`,
+          }),
+          isError: true,
+        };
+      }
+      return {
+        toolCallId: call.id,
+        name: call.name,
+        content: JSON.stringify(report),
+        isError,
+      };
+    });
+
+    const message = toolResultMessage(results);
+    if (message) this.history.push(message);
+  }
+
+  private swdToolReport(result: SWDRunResult): Record<string, unknown> {
+    return {
+      ok: result.success && !result.rolledBack,
+      status: result.success && !result.rolledBack ? 'verified' : 'failed',
+      rolledBack: result.rolledBack,
+      rollbackStatus: result.rollbackStatus,
+      recoveryRequired: result.recoveryRequired,
+      actions: result.results.map((entry) => ({
+        path: entry.action.path,
+        operation: entry.action.operation,
+        status: entry.status,
+        detail: entry.detail,
+      })),
+    };
+  }
+
   // Single seam from a model response to FileActions. With native tools on and
   // tool calls present, use them; otherwise fall back to parsing text
   // FILE_ACTION blocks. This makes tool mode strictly additive — a model that
@@ -456,23 +515,43 @@ class ChatSession {
     const actions = this.extractActions(response);
     warnIfMalformedFileActionOutput(responseText, actions.length, this.ui);
     if (actions.length === 0) {
+      if (response.toolCalls.length > 0) {
+        this.appendToolResults(response, {
+          ok: false,
+          status: 'no-valid-actions',
+          message: 'The tool call did not contain any valid file actions.',
+        }, true);
+      }
       const commandLabel = this.options.mode ?? 'chat';
       appendEntry(`${commandLabel}: ${userInput.slice(0, 80)}`, '✅ clear', this.options.dryRun);
-      return true;
+      return response.toolCalls.length === 0;
     }
 
     if (this.options.dryRun) {
       const dryResult = await dryRunSWD(actions);
+      this.appendToolResults(response, {
+        ok: dryResult.rejected.length === 0,
+        status: 'dry-run',
+        accepted: dryResult.accepted.map((action) => ({ path: action.path, operation: action.operation })),
+        rejected: dryResult.rejected.map((action) => ({ path: action.path, operation: action.operation })),
+      }, dryResult.rejected.length > 0);
       appendEntry(
         summarizeActions(responseText, userInput),
         `🛠️ dry-run: ${dryResult.accepted.length} accepted, ${dryResult.rejected.length} rejected`,
         true
       );
+      // Preserve dry-run command semantics: validation findings are reported in
+      // the tool result and terminal output, but no mutation was attempted.
       return true;
     }
 
     const approvedActions = await this.approveActions(actions, 'SWD security review');
     if (approvedActions.length === 0) {
+      this.appendToolResults(response, {
+        ok: false,
+        status: 'blocked',
+        message: 'No file actions were approved by the SWD security review.',
+      }, true);
       appendEntry(summarizeActions(responseText, userInput), '⚠️ blocked by security policy', false);
       return false;
     }
@@ -482,6 +561,7 @@ class ChatSession {
     this.ui.stopLoading();
     this.recordVerificationOutcome(result);
     printSWDResults(result);
+    this.appendToolResults(response, this.swdToolReport(result), !result.success || result.rolledBack);
 
     let finalResult = result;
     if (!result.success) {
@@ -622,6 +702,8 @@ class ChatSession {
 
       const prompt = `[SWD CORRECTION TURN]\nFile actions failed verification:\n${failures}\n\nPlease correct your response. Attempts remaining: ${MAX_CORRECTION_RETRIES - (attempt - 1)}`;
 
+      const correctionHistoryStart = this.history.length;
+      let assistantRecorded = false;
       this.history.push({ role: 'user', content: prompt });
       this.ui.startLoading(`Correction attempt ${attempt}...`);
 
@@ -634,6 +716,7 @@ class ChatSession {
             systemPrompt: this.finalSystemPrompt || '',
             effort: turnEffort,
             maxTokens: this.maxOutputTokens,
+            tools: this.toolsForRequest(),
             deterministic: !!this.forceProvider,
             forceProvider: this.forceProvider,
             allowFallback: this.allowFallback,
@@ -650,13 +733,29 @@ class ChatSession {
         );
 
         this.ui.write('\n');
-        this.history.push({ role: 'assistant', content: response.text });
+        this.appendAssistantResponse(response);
+        assistantRecorded = true;
         this.budget.record(response.usage.inputTokens, response.usage.outputTokens, response.metadata.modelId, response.metadata.providerId);
 
         const correctionActions = this.extractActions(response);
         warnIfMalformedFileActionOutput(response.text, correctionActions.length, this.ui);
         const approvedCorrectionActions = await this.approveActions(correctionActions, 'SWD correction security review');
+        if (correctionActions.length === 0) {
+          this.appendToolResults(response, {
+            ok: false,
+            status: 'no-valid-actions',
+            message: 'The correction tool call did not contain any valid file actions.',
+          }, true);
+          this.ui.warn('Correction stopped because no valid file actions were returned.');
+          return lastResult;
+        }
+
         if (approvedCorrectionActions.length === 0) {
+          this.appendToolResults(response, {
+            ok: false,
+            status: 'blocked',
+            message: 'No correction actions were approved by the SWD security review.',
+          }, true);
           this.ui.warn('Correction stopped because no file actions were approved.');
           return lastResult;
         }
@@ -666,6 +765,7 @@ class ChatSession {
         this.ui.stopLoading();
         this.recordVerificationOutcome(result);
         printSWDResults(result);
+        this.appendToolResults(response, this.swdToolReport(result), !result.success || result.rolledBack);
 
         if (result.success) {
           this.ui.success('Correction successful.');
@@ -680,6 +780,7 @@ class ChatSession {
       } catch (err: any) {
         this.ui.stopLoading();
         this.ui.error(`Correction failed: ${err.message}`);
+        if (!assistantRecorded) this.history.splice(correctionHistoryStart);
         return lastResult;
       }
     }
@@ -725,50 +826,72 @@ class ChatSession {
     return currentFailureCount;
   }
 
-  private async requestTestFix(prompt: string): Promise<string> {
+  private async requestTestFix(prompt: string): Promise<UnifiedResponse> {
+    const historyStart = this.history.length;
     this.history.push({ role: 'user', content: prompt });
     this.ui.startLoading('Capybara is fixing tests...');
 
     let streamStarted = false;
-    const orchestrator = getOrchestrator();
-    const response = await orchestrator.streamMessage(
-      this.history,
-      {
-        systemPrompt: this.finalSystemPrompt || '',
-        effort: this.options.effort as EffortLevel,
-        maxTokens: this.maxOutputTokens,
-        deterministic: !!this.forceProvider,
-        forceProvider: this.forceProvider,
-        allowFallback: this.allowFallback,
-        timeoutMs: this.timeoutMs,
-        onThinkingDelta: () => { },
-        onTextDelta: (delta) => {
-          if (!streamStarted) {
-            this.ui.stopLoading('\n');
-            streamStarted = true;
+    try {
+      const orchestrator = getOrchestrator();
+      const response = await orchestrator.streamMessage(
+        this.history,
+        {
+          systemPrompt: this.finalSystemPrompt || '',
+          effort: this.options.effort as EffortLevel,
+          maxTokens: this.maxOutputTokens,
+          tools: this.toolsForRequest(),
+          deterministic: !!this.forceProvider,
+          forceProvider: this.forceProvider,
+          allowFallback: this.allowFallback,
+          timeoutMs: this.timeoutMs,
+          onThinkingDelta: () => { },
+          onTextDelta: (delta) => {
+            if (!streamStarted) {
+              this.ui.stopLoading('\n');
+              streamStarted = true;
+            }
+            this.ui.write(delta);
           }
-          this.ui.write(delta);
         }
-      }
-    );
+      );
 
-    this.ui.write('\n');
-    this.history.push({ role: 'assistant', content: response.text });
-    this.budget.record(response.usage.inputTokens, response.usage.outputTokens, response.metadata.modelId, response.metadata.providerId);
-    return response.text;
+      this.ui.write('\n');
+      this.appendAssistantResponse(response);
+      this.budget.record(response.usage.inputTokens, response.usage.outputTokens, response.metadata.modelId, response.metadata.providerId);
+      return response;
+    } catch (error) {
+      this.history.splice(historyStart);
+      throw error;
+    }
   }
 
-  private async applyTestFixResponse(responseText: string, cmd: string, attempts: number, lastOutput: string): Promise<ReceiptTestResult | null> {
-    const actions = parseActions(responseText);
-    warnIfMalformedFileActionOutput(responseText, actions.length, this.ui);
+  private async applyTestFixResponse(
+    response: UnifiedResponse,
+    cmd: string,
+    attempts: number,
+    lastOutput: string,
+  ): Promise<ReceiptTestResult | null> {
+    const actions = this.extractActions(response);
+    warnIfMalformedFileActionOutput(response.text, actions.length, this.ui);
 
     if (actions.length === 0) {
+      this.appendToolResults(response, {
+        ok: false,
+        status: 'no-valid-actions',
+        message: 'The test-fix tool call did not contain any valid file actions.',
+      }, true);
       this.ui.warn('No actionable changes returned by the model. Stopping loop.');
       return summarizeTestResult(cmd, false, attempts, 'no-actions', lastOutput);
     }
 
     const approvedTestFixActions = await this.approveActions(actions, 'Test-fix security review');
     if (approvedTestFixActions.length === 0) {
+      this.appendToolResults(response, {
+        ok: false,
+        status: 'blocked',
+        message: 'No test-fix actions were approved by the SWD security review.',
+      }, true);
       this.ui.warn('No approved test-fix actions remain after security review. Stopping loop.');
       return summarizeTestResult(cmd, false, attempts, 'no-approved-actions', lastOutput);
     }
@@ -778,6 +901,7 @@ class ChatSession {
     this.ui.stopLoading();
     this.recordVerificationOutcome(fixResult);
     printSWDResults(fixResult);
+    this.appendToolResults(response, this.swdToolReport(fixResult), !fixResult.success || fixResult.rolledBack);
 
     if (!fixResult.success) {
       this.ui.error('SWD failed while attempting to fix tests. Yielding.');
@@ -793,8 +917,8 @@ class ChatSession {
     this.ui.log(`${c.dim}Analyzing failure and generating fix...${c.reset}`);
 
     const prompt = buildTestFailurePrompt(cmd, output, hint);
-    const responseText = await this.requestTestFix(prompt);
-    return this.applyTestFixResponse(responseText, cmd, attempts, output);
+    const response = await this.requestTestFix(prompt);
+    return this.applyTestFixResponse(response, cmd, attempts, output);
   }
 
   private async runTestHealingLoop(cmd: string): Promise<ReceiptTestResult> {

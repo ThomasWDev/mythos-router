@@ -1,6 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
+  EXTERNAL_AGENT_ACTION_SCHEMA,
+  MAX_EXTERNAL_AGENT_ACTIONS,
   parseExternalAgentEnvelope,
   validateExternalAgentInput,
   validateTaskContractForActions,
@@ -128,6 +131,111 @@ export const fromText = true;
 
     assert.equal(validation.ok, false);
     assert.match(validation.errors.join('\n'), /unsafe pattern/);
+  });
+
+  it('keeps the published JSON schema synchronized with the runtime schema', () => {
+    const published = JSON.parse(readFileSync('schemas/external-agent-actions.schema.json', 'utf8'));
+    assert.deepEqual(published, EXTERNAL_AGENT_ACTION_SCHEMA);
+  });
+
+  it('accepts exactly the maximum number of JSON actions', () => {
+    const actions = Array.from({ length: MAX_EXTERNAL_AGENT_ACTIONS }, (_, index) => ({
+      path: `src/file-${index}.ts`,
+      operation: 'CREATE',
+      content: 'ok\n',
+    }));
+
+    const validation = validateExternalAgentInput(JSON.stringify(actions));
+    assert.equal(validation.ok, true);
+    assert.equal(validation.actionCount, MAX_EXTERNAL_AGENT_ACTIONS);
+  });
+
+  it('rejects JSON and FILE_ACTION batches larger than the published maximum', () => {
+    const jsonActions = Array.from({ length: MAX_EXTERNAL_AGENT_ACTIONS + 1 }, (_, index) => ({
+      path: `src/file-${index}.ts`,
+      operation: 'CREATE',
+      content: 'ok\n',
+    }));
+    const jsonValidation = validateExternalAgentInput(JSON.stringify(jsonActions));
+    assert.equal(jsonValidation.ok, false);
+    assert.match(jsonValidation.errors.join('\n'), /maximum is 500/);
+
+    const textActions = Array.from({ length: MAX_EXTERNAL_AGENT_ACTIONS + 1 }, (_, index) => [
+      `[FILE_ACTION: src/text-${index}.ts]`,
+      'OPERATION: CREATE',
+      'DESCRIPTION: create',
+      'CONTENT:',
+      'ok',
+      '[/FILE_ACTION]',
+    ].join('\n')).join('\n');
+    const textValidation = validateExternalAgentInput(textActions);
+    assert.equal(textValidation.ok, false);
+    assert.match(textValidation.errors.join('\n'), /maximum is 500/);
+  });
+
+  it('enforces request, summary, agent, and action string limits at runtime', () => {
+    const cases = [
+      { request: 'x'.repeat(501), actions: [{ path: 'a.ts', operation: 'CREATE' }] },
+      { summary: 'x'.repeat(501), actions: [{ path: 'a.ts', operation: 'CREATE' }] },
+      { agent: { id: 'x'.repeat(121) }, actions: [{ path: 'a.ts', operation: 'CREATE' }] },
+      { actions: [{ path: 'a.ts', operation: 'CREATE', description: 'x'.repeat(501) }] },
+    ];
+
+    for (const value of cases) {
+      const validation = validateExternalAgentInput(JSON.stringify(value));
+      assert.equal(validation.ok, false);
+      assert.match(validation.errors.join('\n'), /exceeds/);
+    }
+  });
+
+  it('uses strict uppercase, case-sensitive JSON enums', () => {
+    const lowerOperation = validateExternalAgentInput(JSON.stringify({
+      actions: [{ path: 'a.ts', operation: 'create' }],
+    }));
+    assert.equal(lowerOperation.ok, false);
+    assert.match(lowerOperation.errors.join('\n'), /Expected one of: CREATE, MODIFY, DELETE, READ/);
+
+    const lowerIntent = validateExternalAgentInput(JSON.stringify({
+      actions: [{ path: 'a.ts', operation: 'CREATE', intent: 'mutate' }],
+    }));
+    assert.equal(lowerIntent.ok, false);
+    assert.match(lowerIntent.errors.join('\n'), /Expected one of: MUTATE, NOOP, UNKNOWN/);
+  });
+
+  it('rejects unknown and mistyped nested JSON fields instead of silently dropping them', () => {
+    const unknownAction = validateExternalAgentInput(JSON.stringify({
+      actions: [{ path: 'a.ts', operation: 'CREATE', conten: 'typo' }],
+    }));
+    assert.equal(unknownAction.ok, false);
+    assert.match(unknownAction.errors.join('\n'), /Unknown action key "conten"/);
+    assert.match(unknownAction.errors.join('\n'), /Did you mean "content"/);
+
+    const unknownAgent = validateExternalAgentInput(JSON.stringify({
+      agent: { moddle: 'x' },
+      actions: [{ path: 'a.ts', operation: 'CREATE' }],
+    }));
+    assert.equal(unknownAgent.ok, false);
+    assert.match(unknownAgent.errors.join('\n'), /Unknown agent key "moddle"/);
+
+    const invalidMetadata = validateExternalAgentInput(JSON.stringify({
+      metadata: [],
+      actions: [{ path: 'a.ts', operation: 'CREATE' }],
+    }));
+    assert.equal(invalidMetadata.ok, false);
+    assert.match(invalidMetadata.errors.join('\n'), /metadata must be an object/);
+  });
+
+  it('rejects mixed envelope shapes and empty action arrays', () => {
+    const mixed = validateExternalAgentInput(JSON.stringify({
+      actions: [{ path: 'a.ts', operation: 'CREATE' }],
+      output: 'ignored before phase 3',
+    }));
+    assert.equal(mixed.ok, false);
+    assert.match(mixed.errors.join('\n'), /Unknown external-agent envelope key "output"/);
+
+    const empty = validateExternalAgentInput(JSON.stringify([]));
+    assert.equal(empty.ok, false);
+    assert.match(empty.errors.join('\n'), /No valid file actions/);
   });
 
 });

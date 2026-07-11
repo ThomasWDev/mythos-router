@@ -8,6 +8,7 @@ import {
   type SendOptions,
   type StreamOptions,
   type UnifiedResponse,
+  ProviderError,
 } from '../src/providers/types.js';
 
 function makeResponse(providerId: string, text = 'ok'): UnifiedResponse {
@@ -130,6 +131,47 @@ describe('ProviderOrchestrator', () => {
     assert.equal(failingStates.some((state) => state.degradedUntil > 0), false);
   });
 
+  it('preserves the exact fallback reason and separates retries from provider transitions', async () => {
+    const failures: string[] = [];
+    const telemetry = {
+      updateMetrics: () => {},
+      logDecision: () => {},
+      logFailure: (failure: { errorType: string }) => failures.push(failure.errorType),
+    };
+    const orchestrator = new ProviderOrchestrator(telemetry);
+    const rateLimited = new FakeProvider('rate-limited', ['streaming'], {
+      send: async () => {
+        throw new ProviderError('slow down', {
+          kind: 'rate_limit',
+          providerId: 'rate-limited',
+          retryable: false,
+        });
+      },
+    });
+    const fallback = new FakeProvider('fallback');
+    orchestrator.registerProvider(rateLimited, { priority: 0 });
+    orchestrator.registerProvider(fallback, { priority: 1 });
+
+    const response = await orchestrator.sendMessage(messages, sendOptions);
+    const events = orchestrator.getEventLog();
+
+    assert.equal(response.metadata.providerId, 'fallback');
+    assert.deepEqual(failures, ['rate_limit']);
+    assert.equal(events.length, 2);
+    assert.deepEqual(
+      events.map((event) => ({
+        provider: event.actualProvider,
+        reason: event.fallbackReason,
+        retries: event.retryCount,
+        fallbacks: event.fallbackCount,
+      })),
+      [
+        { provider: 'rate-limited', reason: 'rate_limit', retries: 0, fallbacks: 0 },
+        { provider: 'fallback', reason: 'rate_limit', retries: 0, fallbacks: 1 },
+      ],
+    );
+  });
+
   it('does not call fallback providers when fallback is disabled', async () => {
     const orchestrator = new ProviderOrchestrator(noopTelemetry);
     const failing = new FakeProvider('failing', ['streaming'], {
@@ -234,6 +276,37 @@ describe('ProviderOrchestrator — selection & resilience', () => {
 
     assert.equal(response.metadata.providerId, 'flaky');
     assert.equal(attempts, 3); // two retryable failures, then success
+    const [event] = orchestrator.getEventLog();
+    assert.equal(event.retryCount, 2);
+    assert.equal(event.fallbackCount, 0);
+    assert.equal(event.fallbackReason, undefined);
+  });
+
+  it('enforces the non-streaming timeout as a typed timeout failure', async () => {
+    const hanging: BaseProvider = {
+      id: 'hanging',
+      capabilities: new Set(['streaming']),
+      sendMessage: async (_messages, options) => new Promise<UnifiedResponse>((_resolve, reject) => {
+        const onAbort = () => reject(options.signal?.reason ?? new Error('aborted'));
+        options.signal?.addEventListener('abort', onAbort, { once: true });
+      }),
+      streamMessage: async () => makeResponse('hanging'),
+    };
+    const orchestrator = new ProviderOrchestrator(noopTelemetry);
+    orchestrator.registerProvider(hanging, { priority: 0 });
+
+    await assert.rejects(
+      () => orchestrator.sendMessage(messages, {
+        ...sendOptions,
+        timeoutMs: 15,
+        allowFallback: false,
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof ProviderError);
+        assert.equal(error.kind, 'timeout');
+        return true;
+      },
+    );
   });
 
   it('does not retry a non-retryable failure before falling back', async () => {
@@ -295,6 +368,39 @@ describe('ProviderOrchestrator — selection & resilience', () => {
     assert.equal(slot?.concurrency, 0);
   });
 
+  it('rejects invalid maxConcurrency values at registration', () => {
+    const orchestrator = new ProviderOrchestrator(noopTelemetry);
+    assert.throws(
+      () => orchestrator.registerProvider(new FakeProvider('invalid'), { maxConcurrency: 0 }),
+      /positive integer/,
+    );
+  });
+
+  it('stores normalized cost rather than request-total cost in routing metrics', async () => {
+    const makeSizedProvider = (id: string, inputTokens: number) => new FakeProvider(id, ['streaming'], {
+      send: async () => ({
+        ...makeResponse(id),
+        usage: { inputTokens, outputTokens: 0, latencyMs: 20 },
+        metadata: {
+          ...makeResponse(id).metadata,
+          modelId: 'gpt-4o',
+        },
+      }),
+    });
+
+    const small = new ProviderOrchestrator(noopTelemetry);
+    small.registerProvider(makeSizedProvider('small', 1_000));
+    await small.sendMessage(messages, sendOptions);
+
+    const large = new ProviderOrchestrator(noopTelemetry);
+    large.registerProvider(makeSizedProvider('large', 100_000));
+    await large.sendMessage(messages, sendOptions);
+
+    const smallMetric = small.getProviderHealth()[0].metrics.costPer1k;
+    const largeMetric = large.getProviderHealth()[0].metrics.costPer1k;
+    assert.equal(largeMetric, smallMetric);
+  });
+
   it('excludes disabled providers from routing and provider count', async () => {
     const orchestrator = new ProviderOrchestrator(noopTelemetry);
     const disabled = new FakeProvider('disabled');
@@ -352,6 +458,7 @@ describe('isRetryableError: status precedence and digit-token matching', () => {
   });
 
   it('matches a standalone status token in the message when no status property exists', () => {
+    assert.equal(isRetryableError(new Error('upstream returned 500 Internal Server Error')), true);
     assert.equal(isRetryableError(new Error('upstream returned 503 Service Unavailable')), true);
     assert.equal(isRetryableError(new Error('HTTP 429: rate limited')), true);
   });

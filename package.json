@@ -13,7 +13,9 @@
     "./cli": "./dist/cli.js",
     "./mcp": "./dist/mcp.js",
     "./schema": "./schemas/external-agent-actions.schema.json",
-    "./schemas/external-agent-actions.schema.json": "./schemas/external-agent-actions.schema.json"
+    "./schemas/external-agent-actions.schema.json": "./schemas/external-agent-actions.schema.json",
+    "./policy-schema": "./schemas/project-policy.schema.json",
+    "./schemas/project-policy.schema.json": "./schemas/project-policy.schema.json"
   },
   "files": [
     "dist",

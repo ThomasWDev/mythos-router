@@ -88,13 +88,51 @@ export function getProviderMultiplier(providerId?: string): number {
 
 // ── Public API ───────────────────────────────────────────────
 
+export interface CostEstimate {
+  inputCost: number;
+  outputCost: number;
+  totalCost: number;
+  totalTokens: number;
+  costPer1k: number;
+}
+
+function normalizeTokenCount(value: number): number {
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
 /**
- * Calculate the cost of a request based on the model used.
- * Falls back to conservative estimates for unknown models.
- *
- * Pass `providerId` to apply that provider's price multiplier (e.g. a
- * marketplace discount). Omitting it keeps the published base price, so all
- * existing 3-argument callers are unaffected.
+ * Return both the estimated request total and a request-size-neutral blended
+ * cost per 1,000 processed tokens. The blended rate still reflects the actual
+ * input/output mix, but it no longer grows merely because a request was large.
+ */
+export function estimateCost(
+  modelId: string,
+  inputTokens: number,
+  outputTokens: number,
+  providerId?: string,
+): CostEstimate {
+  const pricing = PRICING_TABLE[modelId] ?? FALLBACK_PRICING;
+  const multiplier = getProviderMultiplier(providerId);
+  const normalizedInput = normalizeTokenCount(inputTokens);
+  const normalizedOutput = normalizeTokenCount(outputTokens);
+  const inputCost = (normalizedInput / 1_000_000) * pricing.inputPer1M * multiplier;
+  const outputCost = (normalizedOutput / 1_000_000) * pricing.outputPer1M * multiplier;
+  const totalCost = inputCost + outputCost;
+  const totalTokens = normalizedInput + normalizedOutput;
+
+  return {
+    inputCost,
+    outputCost,
+    totalCost,
+    totalTokens,
+    costPer1k: totalTokens > 0 ? (totalCost / totalTokens) * 1_000 : 0,
+  };
+}
+
+/**
+ * Calculate the estimated total cost of a request. Kept as the compact,
+ * backwards-compatible API; use `estimateCost` when normalized routing cost is
+ * also required.
  */
 export function calculateCost(
   modelId: string,
@@ -102,12 +140,7 @@ export function calculateCost(
   outputTokens: number,
   providerId?: string,
 ): number {
-  const pricing = PRICING_TABLE[modelId] ?? FALLBACK_PRICING;
-  const multiplier = getProviderMultiplier(providerId);
-  return (
-    (inputTokens / 1_000_000) * pricing.inputPer1M +
-    (outputTokens / 1_000_000) * pricing.outputPer1M
-  ) * multiplier;
+  return estimateCost(modelId, inputTokens, outputTokens, providerId).totalCost;
 }
 
 /**

@@ -5,11 +5,14 @@ import {
   isRetryableKind,
   kindFromStatus,
 } from '../src/providers/types.js';
+import { failureReasonFromError, normalizeProviderError } from '../src/providers/errors.js';
 import { isRetryableError } from '../src/providers/orchestrator.js';
 
 describe('ProviderError + retryability', () => {
   it('maps status codes to kinds', () => {
+    assert.equal(kindFromStatus(408), 'timeout');
     assert.equal(kindFromStatus(429), 'rate_limit');
+    assert.equal(kindFromStatus(499), 'cancelled');
     assert.equal(kindFromStatus(529), 'overloaded');
     assert.equal(kindFromStatus(503), 'server_error');
     assert.equal(kindFromStatus(500), 'server_error');
@@ -19,10 +22,11 @@ describe('ProviderError + retryability', () => {
   });
 
   it('classifies which kinds are retryable', () => {
-    for (const kind of ['rate_limit', 'overloaded', 'server_error', 'network', 'timeout'] as const) {
+    for (const kind of ['rate_limit', 'overloaded', 'server_error', 'network', 'timeout', 'incomplete_response'] as const) {
       assert.equal(isRetryableKind(kind), true, `${kind} should retry`);
     }
     assert.equal(isRetryableKind('client_error'), false);
+    assert.equal(isRetryableKind('cancelled'), false);
     assert.equal(isRetryableKind('unknown'), false);
   });
 
@@ -54,6 +58,32 @@ describe('ProviderError + retryability', () => {
     // A 429 as a standalone token is retryable; embedded in an id it is not.
     assert.equal(isRetryableError(new Error('rate limited (429)')), true);
     assert.equal(isRetryableError(new Error('request req_4290 failed validation')), false);
+  });
+
+  it('normalizes raw SDK-shaped errors without losing structured fields', () => {
+    const cause = Object.assign(new Error('too many requests'), {
+      status: 429,
+      type: 'rate_limit_error',
+      requestID: 'req_abc',
+    });
+    const error = normalizeProviderError(cause, {
+      providerId: 'anthropic',
+      operation: 'API request failed',
+    });
+
+    assert.equal(error.kind, 'rate_limit');
+    assert.equal(error.status, 429);
+    assert.equal(error.providerCode, 'rate_limit_error');
+    assert.equal(error.requestId, 'req_abc');
+    assert.equal(error.cause, cause);
+    assert.equal(failureReasonFromError(error), 'rate_limit');
+  });
+
+  it('maps provider failure kinds to precise fallback reasons', () => {
+    assert.equal(failureReasonFromError(new ProviderError('busy', { kind: 'overloaded' })), 'overloaded');
+    assert.equal(failureReasonFromError(new ProviderError('empty', { kind: 'incomplete_response' })), 'incomplete_response');
+    assert.equal(failureReasonFromError(new ProviderError('cancel', { kind: 'cancelled' })), 'cancelled');
+    assert.equal(failureReasonFromError(new Error('upstream returned 503')), 'server_error');
   });
 
   it('preserves status and providerId on the error', () => {

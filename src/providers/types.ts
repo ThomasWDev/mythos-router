@@ -4,9 +4,37 @@
 // ─────────────────────────────────────────────────────────────
 
 // ── Unified Message Format ───────────────────────────────────
+// Plain string messages remain supported for backward compatibility. Native
+// tool conversations use structured blocks so assistant tool calls and their
+// user-role results survive provider fallback, correction turns, and resume.
+export interface TextMessageBlock {
+  type: 'text';
+  text: string;
+}
+
+export interface ToolCallMessageBlock {
+  type: 'tool_call';
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
+}
+
+export interface ToolResultMessageBlock {
+  type: 'tool_result';
+  toolCallId: string;
+  name?: string;
+  content: string;
+  isError?: boolean;
+}
+
+export type MessageContentBlock =
+  | TextMessageBlock
+  | ToolCallMessageBlock
+  | ToolResultMessageBlock;
+
 export interface Message {
   role: 'user' | 'assistant';
-  content: string;
+  content: string | MessageContentBlock[];
 }
 
 // ── Streaming Chunks ─────────────────────────────────────────
@@ -118,20 +146,34 @@ export interface ProviderConfig {
   id: string;
   priority: number;         // Lower = higher priority in fallback chain
   enabled: boolean;
-  maxConcurrency: number;   // Per-provider token bucket limit
+  maxConcurrency: number;   // Hard per-provider in-flight request limit
 }
 
 // ── Orchestration Event (for observability) ──────────────────
+export type ProviderFailureReason =
+  | 'timeout'
+  | 'rate_limit'
+  | 'overloaded'
+  | 'server_error'
+  | 'network_error'
+  | 'client_error'
+  | 'incomplete_response'
+  | 'capability_mismatch'
+  | 'cancelled'
+  | 'unknown';
+
 export interface OrchestrationEvent {
   timestamp: string;
   sessionId: string;
   command: string;
   primaryProvider: string;
   actualProvider: string;
-  fallbackReason?: 'timeout' | 'rate_limit' | 'server_error' | 'capability_mismatch' | 'network_error';
+  fallbackReason?: ProviderFailureReason;
   latencyMs: number;
-  cost: number;
-  retryCount: number;
+  cost: number;             // Estimated total request cost in USD
+  costPer1k?: number;       // Estimated blended USD per 1,000 processed tokens
+  retryCount: number;       // Same-provider retries, excluding first attempts
+  fallbackCount?: number;   // Provider transitions, excluding the primary
 }
 
 // ── Structured Provider Errors ───────────────────────────────
@@ -145,8 +187,10 @@ export type ProviderErrorKind =
   | 'overloaded'    // provider-signalled overload (e.g. Anthropic 529)
   | 'server_error'  // HTTP 5xx
   | 'network'       // connection refused/reset, DNS, fetch failed
-  | 'timeout'       // request/watchdog timeout
-  | 'client_error'  // HTTP 4xx (non-retryable)
+  | 'timeout'             // request/watchdog timeout
+  | 'client_error'        // HTTP 4xx (non-retryable)
+  | 'incomplete_response' // syntactically valid but unusable success payload
+  | 'cancelled'           // caller-requested cancellation (non-retryable)
   | 'unknown';
 
 export function isRetryableKind(kind: ProviderErrorKind): boolean {
@@ -154,7 +198,8 @@ export function isRetryableKind(kind: ProviderErrorKind): boolean {
     || kind === 'overloaded'
     || kind === 'server_error'
     || kind === 'network'
-    || kind === 'timeout';
+    || kind === 'timeout'
+    || kind === 'incomplete_response';
 }
 
 export interface ProviderErrorOptions {
@@ -163,6 +208,8 @@ export interface ProviderErrorOptions {
   providerId?: string;
   retryable?: boolean;
   cause?: unknown;
+  requestId?: string;
+  providerCode?: string;
 }
 
 export class ProviderError extends Error {
@@ -170,6 +217,8 @@ export class ProviderError extends Error {
   readonly status?: number;
   readonly providerId?: string;
   readonly retryable: boolean;
+  readonly requestId?: string;
+  readonly providerCode?: string;
 
   constructor(message: string, options: ProviderErrorOptions) {
     super(message);
@@ -178,6 +227,8 @@ export class ProviderError extends Error {
     this.status = options.status;
     this.providerId = options.providerId;
     this.retryable = options.retryable ?? isRetryableKind(options.kind);
+    this.requestId = options.requestId;
+    this.providerCode = options.providerCode;
     if (options.cause !== undefined) {
       (this as { cause?: unknown }).cause = options.cause;
     }
@@ -186,7 +237,9 @@ export class ProviderError extends Error {
 
 /** Classify an HTTP status code into a ProviderErrorKind. */
 export function kindFromStatus(status: number): ProviderErrorKind {
+  if (status === 408) return 'timeout';
   if (status === 429) return 'rate_limit';
+  if (status === 499) return 'cancelled';
   if (status === 529) return 'overloaded';
   if (status >= 500) return 'server_error';
   if (status >= 400) return 'client_error';
