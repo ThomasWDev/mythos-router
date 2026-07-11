@@ -1,5 +1,4 @@
 import * as readline from 'node:readline';
-import * as path from 'node:path';
 import { readFileSync } from 'node:fs';
 import { formatTokenUsage, getOrchestrator, type Message } from '../client.js';
 import { SWDEngine, parseActions, summarizeActions, snapshotFile, resolveSafePath, type SWDRunResult, type FileAction } from '../swd.js';
@@ -16,6 +15,7 @@ import { SessionBudget } from '../budget.js';
 import { buildSkillPrompt, type Skill } from '../skills.js';
 import { isGitRepo, hasUncommittedChanges, getCurrentBranch, commitChanges, getLatestHash, createAndCheckoutBranch } from '../git.js';
 import { saveSession, loadSession, formatResumeInfo } from '../session.js';
+import { resolveWorkspace, type WorkspaceContext, type WorkspaceInput } from '../workspace.js';
 import { reviewActions, touchesCommandSurface, touchedWritablePaths, type ActionRiskVerdict } from '../security-policy.js';
 import {
   createSWDReceipt,
@@ -57,11 +57,11 @@ import {
 // importing the ChatUI type from this module unchanged.
 export type { ChatUI } from './chat-ui.js';
 
-function getReceiptGitContext(): { branch?: string; commit?: string } | undefined {
-  if (!isGitRepo()) return undefined;
+function getReceiptGitContext(rootDir: string): { branch?: string; commit?: string } | undefined {
+  if (!isGitRepo(rootDir)) return undefined;
 
-  const branch = getCurrentBranch();
-  const commit = getLatestHash();
+  const branch = getCurrentBranch(rootDir);
+  const commit = getLatestHash(rootDir);
   const git = {
     ...(branch && branch !== 'unknown' ? { branch } : {}),
     ...(commit && commit !== 'unknown' ? { commit } : {}),
@@ -97,8 +97,10 @@ export class ChatSession {
   private swdCorrectionTurns = 0;
   // Opt-in native tool-calling (see --tools). Falls back to text parsing.
   public useNativeTools = false;
+  public readonly workspace: WorkspaceContext;
 
-  constructor(options: ChatOptions, ui: ChatUI) {
+  constructor(options: ChatOptions, ui: ChatUI, workspaceInput?: WorkspaceInput) {
+    this.workspace = resolveWorkspace(workspaceInput);
     this.options = options;
     this.ui = ui;
     this.useNativeTools = options.tools === true;
@@ -111,7 +113,7 @@ export class ChatSession {
     let budgetMultiplier = 1.0;
     try {
       const skills = typeof options.skill === 'string' ? [options.skill] : (options.skill || []);
-      const skillResult = buildSkillPrompt(CAPYBARA_SYSTEM_PROMPT, skills);
+      const skillResult = buildSkillPrompt(CAPYBARA_SYSTEM_PROMPT, skills, this.workspace.rootDir);
       this.finalSystemPrompt = skillResult.prompt;
       this.maxOutputTokens = skillResult.maxOutputTokens;
       this.forceProvider = options.provider ?? skillResult.forceProvider;
@@ -146,6 +148,7 @@ export class ChatSession {
       enableRollback: true,
       onAction: (a) => this.ui.updateLoading(`Executing: ${c.cyan}${a.operation}${c.reset} ${a.path}...`),
       onVerify: (r) => this.ui.updateLoading(`Verifying: ${r.action.path}...`),
+      rootDir: this.workspace.rootDir,
       onRollback: (p, s, e) => {
         if (s) this.ui.updateLoading(`Rolled back: ${p}`);
         else this.ui.updateLoading(`${c.red}Rollback failed${c.reset}: ${p} (${e})`);
@@ -154,7 +157,7 @@ export class ChatSession {
   }
 
   public async initialize() {
-    const context = await getMemoryContext();
+    const context = await getMemoryContext(4000, this.workspace);
     if (context) {
       // Prepend context to the final system prompt (or inject as user message if skills modified it)
       if (this.finalSystemPrompt) {
@@ -169,17 +172,17 @@ export class ChatSession {
   public async setupSandbox(): Promise<string | null> {
     if (!this.options.branch) return null;
 
-    if (!isGitRepo()) throw new Error('Not a git repository. Cannot use --branch flag.');
-    if (hasUncommittedChanges()) throw new Error('Uncommitted changes detected. Please commit or stash before sandboxing.');
+    if (!isGitRepo(this.workspace.rootDir)) throw new Error('Not a git repository. Cannot use --branch flag.');
+    if (hasUncommittedChanges(this.workspace.rootDir)) throw new Error('Uncommitted changes detected. Please commit or stash before sandboxing.');
 
-    const current = getCurrentBranch();
+    const current = getCurrentBranch(this.workspace.rootDir);
     if (current.startsWith('mythos/')) throw new Error(`Already inside a mythos branch: ${current}. Nested sandboxing blocked.`);
 
     const timestampStr = new Date().toISOString().replace(/[-T:]/g, '').slice(0, 12);
     const branchName = `mythos/${this.options.branch}-${timestampStr}`;
 
     logSuccess(`Creating sandbox branch: ${c.bold}${branchName}${c.reset}`);
-    createAndCheckoutBranch(branchName);
+    createAndCheckoutBranch(branchName, this.workspace.rootDir);
     return branchName;
   }
 
@@ -231,7 +234,7 @@ export class ChatSession {
     const prompt = `Please summarize the following older conversation context into a dense, factual summary. Preserve all technical decisions, constraints, paths, and context needed to continue the work.\n\n<history>\n${JSON.stringify(toCompress, null, 2)}\n</history>`;
 
     try {
-      const orchestrator = getOrchestrator();
+      const orchestrator = getOrchestrator(this.workspace);
       const response = await orchestrator.sendMessage(
         [{ role: 'user', content: prompt }],
         {
@@ -251,11 +254,11 @@ export class ChatSession {
         ...toKeep
       ];
 
-      appendEntry('Context Compression', `Summarized ${safeBoundary} turns to prevent context overflow.`, this.options.dryRun);
+      appendEntry('Context Compression', `Summarized ${safeBoundary} turns to prevent context overflow.`, this.options.dryRun, this.workspace);
     } catch (err: any) {
       this.ui.warn(`\n${c.red}Summarization failed (${err.message}). Falling back to hard truncation.${c.reset}`);
       this.history = toKeep;
-      appendEntry('Context Compression', `Hard truncation of ${safeBoundary} turns due to summary failure.`, this.options.dryRun);
+      appendEntry('Context Compression', `Hard truncation of ${safeBoundary} turns due to summary failure.`, this.options.dryRun, this.workspace);
     }
   }
 
@@ -282,7 +285,7 @@ export class ChatSession {
     let streamStarted = false;
 
     try {
-      const orchestrator = getOrchestrator();
+      const orchestrator = getOrchestrator(this.workspace);
       const response = await orchestrator.streamMessage(
         this.history,
         {
@@ -354,7 +357,7 @@ export class ChatSession {
       const warning = this.budget.formatWarning();
       if (warning) this.ui.warn(`\n${warning}`);
 
-      if (needsDream()) {
+      if (needsDream(this.workspace)) {
         this.ui.warn(`\n${c.yellow}💤 Memory approaching capacity. Run ${c.cyan}mythos dream${c.yellow} to compress.${c.reset}`);
       }
       return handled;
@@ -371,7 +374,7 @@ export class ChatSession {
   }
 
   private async approveActions(actions: FileAction[], contextLabel: string): Promise<FileAction[]> {
-    const review = reviewActions(actions);
+    const review = reviewActions(actions, this.workspace.rootDir);
     const approved = [...review.approved];
 
     for (const { action, verdict } of review.blocked) {
@@ -523,12 +526,12 @@ export class ChatSession {
         }, true);
       }
       const commandLabel = this.options.mode ?? 'chat';
-      appendEntry(`${commandLabel}: ${userInput.slice(0, 80)}`, '✅ clear', this.options.dryRun);
+      appendEntry(`${commandLabel}: ${userInput.slice(0, 80)}`, '✅ clear', this.options.dryRun, this.workspace);
       return response.toolCalls.length === 0;
     }
 
     if (this.options.dryRun) {
-      const dryResult = await dryRunSWD(actions);
+      const dryResult = await dryRunSWD(actions, this.workspace.rootDir);
       this.appendToolResults(response, {
         ok: dryResult.rejected.length === 0,
         status: 'dry-run',
@@ -538,7 +541,8 @@ export class ChatSession {
       appendEntry(
         summarizeActions(responseText, userInput),
         `🛠️ dry-run: ${dryResult.accepted.length} accepted, ${dryResult.rejected.length} rejected`,
-        true
+        true,
+        this.workspace,
       );
       // Preserve dry-run command semantics: validation findings are reported in
       // the tool result and terminal output, but no mutation was attempted.
@@ -552,7 +556,7 @@ export class ChatSession {
         status: 'blocked',
         message: 'No file actions were approved by the SWD security review.',
       }, true);
-      appendEntry(summarizeActions(responseText, userInput), '⚠️ blocked by security policy', false);
+      appendEntry(summarizeActions(responseText, userInput), '⚠️ blocked by security policy', false, this.workspace);
       return false;
     }
 
@@ -580,7 +584,7 @@ export class ChatSession {
 
     const status = finalResult.success ? '✅ verified' : `⚠️ ${finalResult.results.filter(r => r.status !== 'verified').length} issues`;
     const summary = summarizeActions(responseText, userInput);
-    appendEntry(summary, status, false);
+    appendEntry(summary, status, false, this.workspace);
 
     // Append file metadata only after a fully successful, non-rolled-back SWD run.
     // This prevents stale hash metadata from being recorded after failed or rolled-back writes.
@@ -616,11 +620,11 @@ export class ChatSession {
           sessionTurns: snap.turns,
           estimatedCostUSD: snap.estimatedCostUSD,
         },
-        git: getReceiptGitContext(),
+        git: getReceiptGitContext(this.workspace.rootDir),
         skills: this.receiptSkills(),
         test: testResult,
-      });
-      saveSWDReceipt(receipt, false);
+      }, this.workspace.rootDir);
+      saveSWDReceipt(receipt, false, this.workspace.rootDir);
       this.ui.log(`${c.dim}Receipt: ${c.cyan}mythos receipts show ${receipt.id}${c.reset}`);
     } catch (err: any) {
       this.ui.warn(`Receipt save failed: ${err.message}`);
@@ -651,7 +655,7 @@ export class ChatSession {
       if (op === 'READ') continue;
 
       try {
-        const absPath = resolveSafePath(res.action.path);
+        const absPath = resolveSafePath(res.action.path, this.workspace.rootDir);
         const snap = snapshotFile(absPath);
         const meta: Record<string, string> = {
           op,
@@ -664,7 +668,7 @@ export class ChatSession {
           meta.size = snap.size.toString();
         }
 
-        appendMetadataBlock(meta, 'file', false);
+        appendMetadataBlock(meta, 'file', false, this.workspace);
       } catch {
         // Metadata is non-authoritative. It improves drift detection,
         // but must never break an otherwise successful SWD run.
@@ -709,7 +713,7 @@ export class ChatSession {
 
       let streamStarted = false;
       try {
-        const orchestrator = getOrchestrator();
+        const orchestrator = getOrchestrator(this.workspace);
         const response = await orchestrator.streamMessage(
           this.history,
           {
@@ -803,7 +807,7 @@ export class ChatSession {
 
   private async runTestAttempt(cmd: string, attempt: number, maxRetries: number): Promise<{ passed: boolean; output: string }> {
     this.ui.startLoading(`Running tests: ${c.cyan}${cmd}${c.reset}...`);
-    const result = await runTestCommand(cmd, resolveTestTimeoutMs(this.options.testTimeout));
+    const result = await runTestCommand(cmd, resolveTestTimeoutMs(this.options.testTimeout), this.workspace.rootDir);
 
     if (result.passed) {
       this.ui.stopLoading();
@@ -833,7 +837,7 @@ export class ChatSession {
 
     let streamStarted = false;
     try {
-      const orchestrator = getOrchestrator();
+      const orchestrator = getOrchestrator(this.workspace);
       const response = await orchestrator.streamMessage(
         this.history,
         {
@@ -963,32 +967,32 @@ export class ChatSession {
     const command = finalizeOptions.command ?? 'chat';
     const shouldSaveSession = finalizeOptions.saveSession ?? true;
     let commitHash = 'none';
-    const repo = isGitRepo();
+    const repo = isGitRepo(this.workspace.rootDir);
     if (repo && !this.options.dryRun) {
       try {
         // Only auto-commit when running in a sandbox branch (--branch).
         // Without --branch, committing would capture the user's unrelated
         // uncommitted work under a generic "mythos: session end" message.
-        if (sandboxBranch && hasUncommittedChanges()) {
+        if (sandboxBranch && hasUncommittedChanges(this.workspace.rootDir)) {
           const touchedFiles = Array.from(this.touchedFiles);
           if (touchedFiles.length > 0) {
-            commitChanges('mythos: session end', touchedFiles);
+            commitChanges('mythos: session end', touchedFiles, this.workspace.rootDir);
           } else {
             logWarn('Auto-commit skipped: no Mythos-managed file paths were recorded.');
           }
         }
-        commitHash = getLatestHash();
+        commitHash = getLatestHash(this.workspace.rootDir);
       } catch (err: any) { logWarn(`Auto-commit failed: ${err.message}`); }
     }
-    const metadata = { commit: commitHash, branch: sandboxBranch || (repo ? getCurrentBranch() : 'none'), timestamp_end: new Date().toISOString() };
-    appendMetadataBlock(metadata, 'meta', this.options.dryRun || false);
+    const metadata = { commit: commitHash, branch: sandboxBranch || (repo ? getCurrentBranch(this.workspace.rootDir) : 'none'), timestamp_end: new Date().toISOString() };
+    appendMetadataBlock(metadata, 'meta', this.options.dryRun || false, this.workspace);
 
     const snap = this.budget.status();
     if (snap.totalTokens > 0) {
       const swdTotal = this.swdActionsVerified + this.swdActionsFailed + this.swdCorrectionTurns;
       saveSessionMetric({
         command,
-        project: path.basename(process.cwd()),
+        project: this.workspace.projectName,
         inputTokens: snap.inputTokens,
         outputTokens: snap.outputTokens,
         turns: snap.turns,
@@ -1014,7 +1018,7 @@ export class ChatSession {
           inputTokens: snap.inputTokens,
           outputTokens: snap.outputTokens,
           turns: snap.turns,
-        }, path.basename(process.cwd()));
+        }, this.workspace.projectName, this.workspace);
       } catch (err: any) {
         logWarn(`Session save failed: ${err.message}`);
       }
@@ -1025,14 +1029,15 @@ export class ChatSession {
 export async function chatCommand(options: ChatOptions): Promise<void> {
   validateProviderKeys();
   const ui = new TerminalUI(new Spinner());
-  const session = new ChatSession(options, ui);
+  const workspace = resolveWorkspace();
+  const session = new ChatSession(options, ui, workspace);
 
   ui.log(BANNER);
 
   // ── Resume previous session if requested ────────────────
   if (options.resume) {
-    const saved = loadSession();
-    const currentProject = path.basename(process.cwd());
+    const saved = loadSession(workspace);
+    const currentProject = workspace.projectName;
     if (saved && saved.project && saved.project !== currentProject) {
       ui.warn(
         `Last saved session was for project "${saved.project}", not "${currentProject}". Starting fresh to avoid cross-project context.`,
@@ -1057,16 +1062,16 @@ export async function chatCommand(options: ChatOptions): Promise<void> {
   }
 
   // ── Session Card ────────────────────────────────────────
-  const repo = isGitRepo();
+  const repo = isGitRepo(workspace.rootDir);
   const snap = session.budget.status();
   const cardConfig: SessionCardConfig = {
     provider: session.forceProvider ?? 'auto',
     model: MODELS[options.effort ?? 'high'] || MODELS.high,
     dryRun: options.dryRun === true,
     budgetEnabled: options.budget !== false,
-    branch: sandboxBranch || (repo ? getCurrentBranch() : 'none'),
-    memoryEntries: getEntryCount(),
-    memoryActive: getEntryCount() > 0,
+    branch: sandboxBranch || (repo ? getCurrentBranch(workspace.rootDir) : 'none'),
+    memoryEntries: getEntryCount(workspace),
+    memoryActive: getEntryCount(workspace) > 0,
     tokensUsed: snap.totalTokens,
     maxTokens: snap.maxTokens,
     turnsUsed: snap.turns,
@@ -1094,7 +1099,7 @@ export async function chatCommand(options: ChatOptions): Promise<void> {
   });
 
   // Track starting memory count for exit summary delta
-  const startMemoryEntries = getEntryCount();
+  const startMemoryEntries = getEntryCount(workspace);
   const startTime = Date.now();
 
   let finalized = false;
@@ -1116,7 +1121,7 @@ export async function chatCommand(options: ChatOptions): Promise<void> {
       tokens: snap.totalTokens,
       maxTokens: snap.maxTokens,
       cost: snap.estimatedCostUSD,
-      memoryEntriesAdded: Math.max(0, getEntryCount() - startMemoryEntries),
+      memoryEntriesAdded: Math.max(0, getEntryCount(workspace) - startMemoryEntries),
       saved: !options.dryRun && session.history.length > 0,
     };
     if (snap.totalTokens > 0) {
@@ -1156,16 +1161,16 @@ export async function chatCommand(options: ChatOptions): Promise<void> {
     }
 
     if (cmd === '/status') {
-      const currentRepo = isGitRepo();
+      const currentRepo = isGitRepo(workspace.rootDir);
       const currentSnap = session.budget.status();
       const statusCard: SessionCardConfig = {
         provider: session.forceProvider ?? 'auto',
         model: MODELS[options.effort ?? 'high'] || MODELS.high,
         dryRun: options.dryRun === true,
         budgetEnabled: options.budget !== false,
-        branch: sandboxBranch || (currentRepo ? getCurrentBranch() : 'none'),
-        memoryEntries: getEntryCount(),
-        memoryActive: getEntryCount() > 0,
+        branch: sandboxBranch || (currentRepo ? getCurrentBranch(workspace.rootDir) : 'none'),
+        memoryEntries: getEntryCount(workspace),
+        memoryActive: getEntryCount(workspace) > 0,
         tokensUsed: currentSnap.totalTokens,
         maxTokens: currentSnap.maxTokens,
         turnsUsed: currentSnap.turns,
@@ -1185,7 +1190,7 @@ export async function chatCommand(options: ChatOptions): Promise<void> {
     }
 
     if (cmd === '/memory') {
-      printMemoryStatus();
+      printMemoryStatus(workspace);
       rl.prompt();
       return;
     }
@@ -1212,9 +1217,10 @@ export async function chatCommand(options: ChatOptions): Promise<void> {
 
 // -- Run command and local helpers -----------------------------
 export async function runCommand(prompt: string, options: RunOptions): Promise<void> {
+  const workspace = resolveWorkspace();
   let input: string;
   try {
-    input = await resolveRunPrompt(prompt, options);
+    input = await resolveRunPrompt(prompt, options, workspace.rootDir);
   } catch (err: any) {
     logError(err.message);
     process.exitCode = 1;
@@ -1224,7 +1230,7 @@ export async function runCommand(prompt: string, options: RunOptions): Promise<v
   validateProviderKeys();
   const runOptions = normalizeRunOptions(options);
   const ui = new TerminalUI(new Spinner());
-  const session = new ChatSession(runOptions, ui);
+  const session = new ChatSession(runOptions, ui, workspace);
 
   let sandboxBranch: string | null = null;
   try {
@@ -1236,16 +1242,16 @@ export async function runCommand(prompt: string, options: RunOptions): Promise<v
     return;
   }
 
-  const repo = isGitRepo();
+  const repo = isGitRepo(workspace.rootDir);
   const snap = session.budget.status();
   const cardConfig: SessionCardConfig = {
     provider: session.forceProvider ?? 'auto',
     model: MODELS[runOptions.effort ?? 'high'] || MODELS.high,
     dryRun: runOptions.dryRun === true,
     budgetEnabled: runOptions.budget !== false,
-    branch: sandboxBranch || (repo ? getCurrentBranch() : 'none'),
-    memoryEntries: getEntryCount(),
-    memoryActive: getEntryCount() > 0,
+    branch: sandboxBranch || (repo ? getCurrentBranch(workspace.rootDir) : 'none'),
+    memoryEntries: getEntryCount(workspace),
+    memoryActive: getEntryCount(workspace) > 0,
     tokensUsed: snap.totalTokens,
     maxTokens: snap.maxTokens,
     turnsUsed: snap.turns,
@@ -1262,7 +1268,7 @@ export async function runCommand(prompt: string, options: RunOptions): Promise<v
   if (badges) ui.log(badges);
   ui.divider();
 
-  const startMemoryEntries = getEntryCount();
+  const startMemoryEntries = getEntryCount(workspace);
   const startTime = Date.now();
   let ok = false;
   let finalized = false;
@@ -1287,7 +1293,7 @@ export async function runCommand(prompt: string, options: RunOptions): Promise<v
       `Turns: ${finalSnap.turns}/${finalSnap.maxTurns} | ` +
       `Tokens: ${finalSnap.totalTokens.toLocaleString()}/${finalSnap.maxTokens.toLocaleString()} | ` +
       `Cost: ~$${finalSnap.estimatedCostUSD.toFixed(4)} | ` +
-      `Memory entries: +${Math.max(0, getEntryCount() - startMemoryEntries)}${c.reset}`,
+      `Memory entries: +${Math.max(0, getEntryCount(workspace) - startMemoryEntries)}${c.reset}`,
     );
   }
 

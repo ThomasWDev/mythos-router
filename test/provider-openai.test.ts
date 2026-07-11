@@ -18,6 +18,34 @@ function provider(): OpenAIProvider {
   });
 }
 
+describe('OpenAIProvider base URL normalization', () => {
+  it('removes trailing slashes without a backtracking regular expression', () => {
+    const instance = new OpenAIProvider({
+      id: 'openai-test',
+      apiKey: 'test-key',
+      baseUrl: 'https://example.invalid/v1////',
+      defaultModel: 'gpt-4o',
+    });
+
+    assert.equal(
+      (instance as unknown as { baseUrl: string }).baseUrl,
+      'https://example.invalid/v1',
+    );
+  });
+
+  it('handles adversarial slash-heavy library input in linear time semantics', () => {
+    const slashHeavy = '/'.repeat(250_000) + 'x';
+    const instance = new OpenAIProvider({
+      id: 'openai-test',
+      apiKey: 'test-key',
+      baseUrl: slashHeavy,
+      defaultModel: 'gpt-4o',
+    });
+
+    assert.equal((instance as unknown as { baseUrl: string }).baseUrl, slashHeavy);
+  });
+});
+
 describe('OpenAIProvider response normalization', () => {
   it('treats a non-streaming tool-call-only response as complete', async () => {
     globalThis.fetch = async () => new Response(JSON.stringify({

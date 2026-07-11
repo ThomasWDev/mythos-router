@@ -32,6 +32,7 @@ import { swdCommand } from './commands/swd.js';
 import { mcpCommand } from './commands/mcp.js';
 import { runsCommand } from './commands/runs.js';
 import { policyCommand } from './commands/policy.js';
+import { doctorCommand } from './commands/doctor.js';
 import {
   DEFAULT_MAX_TOKENS_PER_SESSION,
   DEFAULT_MAX_TURNS,
@@ -369,6 +370,14 @@ program
   .option('--dry-run', 'Preview the generated skill without writing files')
   .option('--json', 'Print machine-readable JSON')
   .action(learnCommand);
+
+// mythos doctor
+program
+  .command('doctor')
+  .description('Inspect workspace health and safely recover inactive SWD transactions')
+  .option('--json', 'Print machine-readable JSON')
+  .option('--repair', 'Recover inactive SWD journals and remove safe terminal residue')
+  .action(doctorCommand);
 
 // ── mythos init ──────────────────────────────────────────────
 program

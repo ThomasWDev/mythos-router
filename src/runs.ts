@@ -75,8 +75,9 @@ export function getRunsDir(rootDir = process.cwd()): string {
 export function saveRunRecord(
   output: SWDApplyResult,
   context: { request?: string; summary?: string } = {},
+  rootDir = process.cwd(),
 ): { id: string; path: string } {
-  const dir = getRunsDir();
+  const dir = getRunsDir(rootDir);
   mkdirSync(dir, { recursive: true });
 
   const timestamp = new Date().toISOString();
@@ -113,8 +114,8 @@ export function saveRunRecord(
   return { id, path: filePath };
 }
 
-export function listRuns(limit = 10): RunSummary[] {
-  return runFiles()
+export function listRuns(limit = 10, rootDir = process.cwd()): RunSummary[] {
+  return runFiles(rootDir)
     .slice(0, Math.max(1, Math.min(100, Math.floor(limit))))
     .map((filePath) => readRunFile(filePath))
     .filter((record): record is RunRecord => record !== null)
@@ -136,8 +137,8 @@ export function listRuns(limit = 10): RunSummary[] {
     }));
 }
 
-export function readRun(target = 'latest'): RunRecord | null {
-  const filePath = runPathFor(target);
+export function readRun(target = 'latest', rootDir = process.cwd()): RunRecord | null {
+  const filePath = runPathFor(target, rootDir);
   return filePath ? readRunFile(filePath) : null;
 }
 
@@ -180,8 +181,8 @@ function createRunId(timestamp: string, output: SWDApplyResult, files: RunFileSu
   return `run-${stamp}-${digest}`;
 }
 
-function runFiles(): string[] {
-  const dir = getRunsDir();
+function runFiles(rootDir = process.cwd()): string[] {
+  const dir = getRunsDir(rootDir);
   if (!existsSync(dir)) return [];
 
   return readdirSync(dir)
@@ -190,12 +191,12 @@ function runFiles(): string[] {
     .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
 }
 
-function runPathFor(target: string): string | null {
-  const files = runFiles();
+function runPathFor(target: string, rootDir = process.cwd()): string | null {
+  const files = runFiles(rootDir);
   if (target === 'latest') return files[0] ?? null;
 
   const id = target.endsWith('.json') ? target.slice(0, -5) : target;
-  const direct = join(getRunsDir(), `${id}.json`);
+  const direct = join(getRunsDir(rootDir), `${id}.json`);
   if (existsSync(direct)) return direct;
   if (existsSync(target)) return target;
   return null;

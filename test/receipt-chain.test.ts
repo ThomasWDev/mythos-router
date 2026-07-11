@@ -165,6 +165,81 @@ describe('receipt hash chain', () => {
     assert.match(chain.reason ?? '', /link|prevHash/i);
   });
 
+
+  it('detects duplicate sequence numbers explicitly', () => {
+    const a = appendReceipt('a');
+    appendReceipt('b');
+
+    const duplicate = createSWDReceipt({
+      request: 'duplicate-seq',
+      summary: 'duplicate seq',
+      result: { success: true, rolledBack: false, rollbackErrors: [], errors: [], results: [] },
+    });
+    duplicate.chain = { seq: 1, prevHash: a.integrity!.sha256 };
+    const { integrity: _omit, ...payload } = duplicate;
+    duplicate.integrity = { sha256: createHash('sha256').update(JSON.stringify(payload)).digest('hex') };
+    writeFileSync(join(getReceiptsDir(), `${duplicate.id}.json`), JSON.stringify(duplicate, null, 2));
+
+    const chain = verifyReceiptChain();
+    assert.equal(chain.ok, false);
+    assert.equal(chain.brokenAt, 1);
+    assert.match(chain.reason ?? '', /duplicate chain sequence/i);
+  });
+
+  it('detects two receipts branching from the same previous hash', () => {
+    const a = appendReceipt('a');
+    appendReceipt('b');
+    appendReceipt('c');
+
+    const files = receiptFilesBySeq();
+    const c = JSON.parse(readFileSync(files[2], 'utf8')) as SWDReceipt;
+    c.chain!.prevHash = a.integrity!.sha256;
+    const { integrity: _omit, ...payload } = c;
+    c.integrity = { sha256: createHash('sha256').update(JSON.stringify(payload)).digest('hex') };
+    writeFileSync(files[2], JSON.stringify(c, null, 2));
+
+    const chain = verifyReceiptChain();
+    assert.equal(chain.ok, false);
+    assert.match(chain.reason ?? '', /fork/i);
+  });
+
+  it('detects a missing HEAD pointer when chained receipts exist', () => {
+    appendReceipt('a');
+    unlinkSync(join(getReceiptsDir(), 'chain-head.json'));
+
+    const chain = verifyReceiptChain();
+    assert.equal(chain.ok, false);
+    assert.equal(chain.headMatches, false);
+    assert.match(chain.reason ?? '', /HEAD is missing/i);
+  });
+
+  it('detects an unreadable receipt file instead of silently skipping it', () => {
+    appendReceipt('a');
+    writeFileSync(join(getReceiptsDir(), 'swd-broken.json'), '{not-json');
+
+    const chain = verifyReceiptChain();
+    assert.equal(chain.ok, false);
+    assert.match(chain.reason ?? '', /unreadable|invalid JSON/i);
+  });
+
+
+  it('refuses to append while the existing chain is broken', () => {
+    appendReceipt('a');
+    appendReceipt('b');
+    const beforeFiles = receiptFilesBySeq();
+    const brokenReceipt = JSON.parse(readFileSync(beforeFiles[1], 'utf8')) as SWDReceipt;
+    brokenReceipt.summary = 'tampered without updating integrity';
+    writeFileSync(beforeFiles[1], JSON.stringify(brokenReceipt, null, 2));
+
+    const next = createSWDReceipt({
+      request: 'must not append',
+      summary: 'must not append',
+      result: { success: true, rolledBack: false, rollbackErrors: [], errors: [], results: [] },
+    });
+    assert.throws(() => saveSWDReceipt(next), /broken receipt chain/i);
+    assert.equal(receiptFilesBySeq().length, beforeFiles.length);
+  });
+
   it('ignores legacy receipts that predate chaining', () => {
     // A receipt with no `chain` field (as written by older versions) must not
     // be treated as a broken chain.

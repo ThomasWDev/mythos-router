@@ -13,6 +13,7 @@ import { DEFAULT_IGNORE_PATTERNS, MYTHOSIGNORE_FILE, PROJECT_POLICY_FILE, detect
 import { initMemory, getMemoryPath } from '../memory.js';
 import { ensureSkillsDir, getProjectSkillsDir, listSkills } from '../skills.js';
 import { projectPolicyTemplate } from '../project-policy.js';
+import { resolveWorkspace, type WorkspaceContext } from '../workspace.js';
 
 // ── Constants ────────────────────────────────────────────────
 const MIN_NODE_MAJOR = 20;
@@ -25,7 +26,7 @@ interface EnvCheck {
   hint?: string;
 }
 
-function checkEnvironment(): EnvCheck[] {
+function checkEnvironment(rootDir: string): EnvCheck[] {
   const checks: EnvCheck[] = [];
 
   // 1. Node version
@@ -66,7 +67,7 @@ function checkEnvironment(): EnvCheck[] {
   });
 
   // 3. Git repo detection
-  const isGit = existsSync(resolve(process.cwd(), '.git'));
+  const isGit = existsSync(resolve(rootDir, '.git'));
   checks.push({
     label: 'Git repository',
     ok: isGit,
@@ -123,8 +124,8 @@ interface ScaffoldResult {
   action: 'created' | 'exists' | 'skipped' | 'missing';
 }
 
-function scaffoldIgnoreFile(force: boolean): ScaffoldResult {
-  const target = resolve(process.cwd(), MYTHOSIGNORE_FILE);
+function scaffoldIgnoreFile(force: boolean, workspace: WorkspaceContext): ScaffoldResult {
+  const target = resolve(workspace.rootDir, MYTHOSIGNORE_FILE);
 
   if (existsSync(target) && !force) {
     return { file: MYTHOSIGNORE_FILE, action: 'exists' };
@@ -140,26 +141,26 @@ function scaffoldIgnoreFile(force: boolean): ScaffoldResult {
   return { file: MYTHOSIGNORE_FILE, action: 'created' };
 }
 
-function scaffoldMemory(force: boolean): ScaffoldResult {
-  const memPath = getMemoryPath();
+function scaffoldMemory(force: boolean, workspace: WorkspaceContext): ScaffoldResult {
+  const memPath = getMemoryPath(workspace);
 
   if (existsSync(memPath) && !force) {
     return { file: 'MEMORY.md', action: 'exists' };
   }
 
-  initMemory(false);
+  initMemory(false, workspace);
   return { file: 'MEMORY.md', action: existsSync(memPath) ? 'created' : 'skipped' };
 }
 
-function scaffoldSkillsDir(): ScaffoldResult {
-  const dir = getProjectSkillsDir();
+function scaffoldSkillsDir(workspace: WorkspaceContext): ScaffoldResult {
+  const dir = getProjectSkillsDir(workspace.rootDir);
   const existed = existsSync(dir);
-  ensureSkillsDir('project');
+  ensureSkillsDir('project', workspace.rootDir);
   return { file: '.mythos/skills/', action: existed ? 'exists' : 'created' };
 }
 
-function scaffoldProjectPolicy(force: boolean): ScaffoldResult {
-  const target = resolve(process.cwd(), PROJECT_POLICY_FILE);
+function scaffoldProjectPolicy(force: boolean, workspace: WorkspaceContext): ScaffoldResult {
+  const target = resolve(workspace.rootDir, PROJECT_POLICY_FILE);
 
   if (existsSync(target) && !force) {
     return { file: PROJECT_POLICY_FILE, action: 'exists' };
@@ -170,23 +171,23 @@ function scaffoldProjectPolicy(force: boolean): ScaffoldResult {
   return { file: PROJECT_POLICY_FILE, action: 'created' };
 }
 
-function inspectScaffoldState(): ScaffoldResult[] {
+function inspectScaffoldState(workspace: WorkspaceContext): ScaffoldResult[] {
   return [
     {
       file: MYTHOSIGNORE_FILE,
-      action: existsSync(resolve(process.cwd(), MYTHOSIGNORE_FILE)) ? 'exists' : 'missing',
+      action: existsSync(resolve(workspace.rootDir, MYTHOSIGNORE_FILE)) ? 'exists' : 'missing',
     },
     {
       file: 'MEMORY.md',
-      action: existsSync(getMemoryPath()) ? 'exists' : 'missing',
+      action: existsSync(getMemoryPath(workspace)) ? 'exists' : 'missing',
     },
     {
       file: '.mythos/skills/',
-      action: existsSync(getProjectSkillsDir()) ? 'exists' : 'missing',
+      action: existsSync(getProjectSkillsDir(workspace.rootDir)) ? 'exists' : 'missing',
     },
     {
       file: PROJECT_POLICY_FILE,
-      action: existsSync(resolve(process.cwd(), PROJECT_POLICY_FILE)) ? 'exists' : 'missing',
+      action: existsSync(resolve(workspace.rootDir, PROJECT_POLICY_FILE)) ? 'exists' : 'missing',
     },
   ];
 }
@@ -207,6 +208,7 @@ interface InitOptions {
 }
 
 export async function initCommand(options: InitOptions): Promise<void> {
+  const workspace = resolveWorkspace();
   const force = options.force ?? false;
   const checkOnly = options.check ?? false;
 
@@ -216,7 +218,7 @@ export async function initCommand(options: InitOptions): Promise<void> {
 
   // ── 1. Environment Validation ──────────────────────────────
   console.log(`${c.cyan}${c.bold}  Environment${c.reset}`);
-  const envChecks = checkEnvironment();
+  const envChecks = checkEnvironment(workspace.rootDir);
   let envFatal = false;
 
   for (const check of envChecks) {
@@ -263,12 +265,12 @@ export async function initCommand(options: InitOptions): Promise<void> {
   // ── 3. Scaffold Project Files ──────────────────────────────
   console.log(`${c.cyan}${c.bold}  ${checkOnly ? 'Project files' : 'Scaffolding'}${c.reset}`);
   const results: ScaffoldResult[] = checkOnly
-    ? inspectScaffoldState()
+    ? inspectScaffoldState(workspace)
     : [
-      scaffoldIgnoreFile(force),
-      scaffoldMemory(force),
-      scaffoldSkillsDir(),
-      scaffoldProjectPolicy(force),
+      scaffoldIgnoreFile(force, workspace),
+      scaffoldMemory(force, workspace),
+      scaffoldSkillsDir(workspace),
+      scaffoldProjectPolicy(force, workspace),
     ];
 
   for (const r of results) {
@@ -288,7 +290,7 @@ export async function initCommand(options: InitOptions): Promise<void> {
   }
 
   // Show existing skills if any
-  const skills = listSkills();
+  const skills = listSkills(workspace.rootDir);
   if (skills.length > 0) {
     console.log(`  ${c.dim}${skills.length} skill(s) available: ${skills.map(s => s.name).join(', ')}${c.reset}`);
   }
@@ -309,7 +311,7 @@ export async function initCommand(options: InitOptions): Promise<void> {
       console.log(`  ${c.green}✔${c.reset} Project scaffolding is present`);
     }
   } else if (created > 0) {
-    console.log(`  ${c.green}✔${c.reset} Initialized in ${c.bold}${process.cwd()}${c.reset}`);
+    console.log(`  ${c.green}✔${c.reset} Initialized in ${c.bold}${workspace.rootDir}${c.reset}`);
   } else if (existed === results.length) {
     console.log(`  ${c.green}✔${c.reset} Already initialized${force ? '' : ` ${c.dim}(use ${c.cyan}--force${c.dim} to re-scaffold)${c.reset}`}`);
   }

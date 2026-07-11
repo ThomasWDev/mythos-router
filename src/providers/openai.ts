@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   type BaseProvider,
   type Message,
@@ -6,6 +7,7 @@ import {
   type UnifiedResponse,
   type ProviderCapability,
   type UnifiedToolCall,
+  type ProviderTelemetryIdentity,
   ProviderError,
   kindFromStatus,
 } from './types.js';
@@ -47,6 +49,12 @@ function detectReasoningModel(model: string): boolean {
   return /^o[0-9]/i.test(model);
 }
 
+function stripTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end -= 1;
+  return end === value.length ? value : value.slice(0, end);
+}
+
 function parseSSELine(line: string): Record<string, unknown> | null {
   if (!line.startsWith('data: ')) return null;
   const data = line.slice(6).trim();
@@ -62,6 +70,7 @@ function parseSSELine(line: string): Record<string, unknown> | null {
 export class OpenAIProvider implements BaseProvider {
   readonly id: string;
   readonly capabilities: ReadonlySet<ProviderCapability>;
+  readonly telemetryIdentity: ProviderTelemetryIdentity;
 
   private apiKey: string;
   private baseUrl: string;
@@ -73,8 +82,12 @@ export class OpenAIProvider implements BaseProvider {
   constructor(config: OpenAIProviderConfig) {
     this.id = config.id;
     this.apiKey = config.apiKey;
-    this.baseUrl = config.baseUrl.replace(/\/+$/, ''); // Strip trailing slash
+    this.baseUrl = stripTrailingSlashes(config.baseUrl);
     this.defaultModel = config.defaultModel;
+    this.telemetryIdentity = {
+      modelId: config.defaultModel,
+      endpointHash: createHash('sha256').update(this.baseUrl).digest('hex').slice(0, 16),
+    };
     this.supportsThinking = config.supportsThinking ?? false;
     this.reasoningModel = config.reasoningModel ?? detectReasoningModel(config.defaultModel);
     this.includeUsage = config.includeUsageStreamOption ?? true;

@@ -1,7 +1,7 @@
 {
   "name": "mythos-router",
-  "version": "1.22.1",
-  "description": "Capybara-tier CLI router — Claude Opus 4.8 with Adaptive Thinking, Strict Write Discipline, and Self-Healing Memory",
+  "version": "1.23.0",
+  "description": "Capybara-tier CLI router \u2014 Claude Opus 4.8 with Adaptive Thinking, Strict Write Discipline, and Self-Healing Memory",
   "type": "module",
   "bin": {
     "mythos": "dist/cli.js",
@@ -32,7 +32,7 @@
     "build": "tsc",
     "prepare": "npm run build",
     "test": "node --import tsx --test \"test/**/*.test.ts\"",
-    "test:coverage": "node --import tsx --test --experimental-test-coverage \"test/**/*.test.ts\"",
+    "test:coverage": "node --import tsx --test --test-concurrency=4 --experimental-test-coverage \"--test-coverage-include=src/**/*.ts\" --test-coverage-lines=35 --test-coverage-functions=40 --test-coverage-branches=50 \"test/**/*.test.ts\"",
     "prepublishOnly": "npm run build",
     "start": "node dist/cli.js",
     "chat": "tsx src/cli.ts chat",
@@ -43,7 +43,8 @@
     "runs": "tsx src/cli.ts runs",
     "policy": "tsx src/cli.ts policy",
     "init": "tsx src/cli.ts init",
-    "rebuild": "tsx -e \"import { rebuildIndex } from './src/memory.js'; rebuildIndex();\""
+    "rebuild": "tsx -e \"import { rebuildIndex } from './src/memory.js'; rebuildIndex();\"",
+    "test:package": "node scripts/package-smoke.mjs"
   },
   "keywords": [
     "claude",

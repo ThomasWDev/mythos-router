@@ -17,6 +17,7 @@ import {
 import { estimateCost } from './pricing.js';
 import { extractStatusCode, failureReasonFromError } from './errors.js';
 import { messagesCharLength, serializeMessageForRouting } from './messages.js';
+import type { WorkspaceInput } from '../workspace.js';
 
 // ── EMA-Based Model Metrics ──────────────────────────────────
 interface ModelMetrics {
@@ -40,9 +41,14 @@ interface ProviderSlot {
   metrics: ModelMetrics;
   activeConcurrency: number;
   degradedUntil: number;  // Timestamp when circuit breaker resets
+  telemetryScope: string;
+  telemetryModelId: string;
+  telemetryEndpointHash: string;
 }
 
-type OrchestratorTelemetry = Pick<TelemetryStore, 'updateMetrics' | 'logDecision' | 'logFailure'>;
+type OrchestratorTelemetry = Pick<TelemetryStore, 'updateMetrics' | 'logDecision' | 'logFailure'> & {
+  getProviderMetric?: (scopeKey: string) => TelemetryProviderState | null;
+};
 
 // ── Retry Configuration ──────────────────────────────────────
 const RETRY_BACKOFFS_MS = [100, 500, 1000] as const;
@@ -158,7 +164,7 @@ export class ProviderOrchestrator {
   private telemetry: OrchestratorTelemetry;
   private capacityWaiters = new Set<() => void>();
 
-  constructor(telemetry?: OrchestratorTelemetry) {
+  constructor(telemetry?: OrchestratorTelemetry, workspaceInput?: WorkspaceInput) {
     this.sessionId = createHash('sha256')
       .update(`${Date.now()}-${Math.random()}`)
       .digest('hex')
@@ -169,7 +175,7 @@ export class ProviderOrchestrator {
     }
 
     try {
-      this.telemetry = TelemetryStore.getInstance();
+      this.telemetry = TelemetryStore.getInstance(workspaceInput);
     } catch {
       this.telemetry = {
         updateMetrics: () => {},
@@ -193,24 +199,32 @@ export class ProviderOrchestrator {
       maxConcurrency: requestedMaxConcurrency,
     };
 
+    const identity = provider.telemetryIdentity ?? { modelId: 'unknown', endpointHash: 'default' };
+    const telemetryScope = `${provider.id}:${identity.modelId}:${identity.endpointHash}`;
+    const persisted = this.telemetry.getProviderMetric?.(telemetryScope) ?? null;
+    const degradedUntil = persisted?.degradedUntil ?? 0;
+
     this.slots.push({
       provider,
       config: fullConfig,
-      status: 'healthy',
+      status: degradedUntil > Date.now() ? 'degraded' : 'healthy',
       metrics: {
-        successRate: 1.0,
-        avgLatency: 1000,
-        prevSuccessRate: 1.0,
-        prevAvgLatency: 1000,
-        costPer1k: 0,
-        totalCalls: 0,
-        totalFailures: 0,
+        successRate: persisted?.successRate ?? 1.0,
+        avgLatency: persisted?.avgLatency ?? 1000,
+        prevSuccessRate: persisted?.prevSuccessRate ?? 1.0,
+        prevAvgLatency: persisted?.prevAvgLatency ?? 1000,
+        costPer1k: persisted?.costPer1k ?? 0,
+        totalCalls: persisted?.totalCalls ?? 0,
+        totalFailures: persisted?.totalFailures ?? 0,
         consecutiveFailures: 0,
         lastError: null,
         lastErrorTime: 0,
       },
       activeConcurrency: 0,
-      degradedUntil: 0,
+      degradedUntil,
+      telemetryScope,
+      telemetryModelId: identity.modelId,
+      telemetryEndpointHash: identity.endpointHash,
     });
   }
 
@@ -325,10 +339,14 @@ export class ProviderOrchestrator {
   private pushTelemetryState(slot: ProviderSlot): void {
     this.telemetry.updateMetrics({
       id: slot.provider.id,
+      scopeKey: slot.telemetryScope,
+      modelId: slot.telemetryModelId,
+      endpointHash: slot.telemetryEndpointHash,
       successRate: slot.metrics.successRate,
       avgLatency: slot.metrics.avgLatency,
       prevSuccessRate: slot.metrics.prevSuccessRate,
       prevAvgLatency: slot.metrics.prevAvgLatency,
+      costPer1k: slot.metrics.costPer1k,
       totalCalls: slot.metrics.totalCalls,
       totalFailures: slot.metrics.totalFailures,
       degradedUntil: slot.degradedUntil
@@ -471,6 +489,7 @@ export class ProviderOrchestrator {
     this.telemetry.logDecision({
       timestamp: Date.now(),
       selectedProvider: winner.provider.id,
+      selectedScope: winner.telemetryScope,
       taskType,
       inputSizeBucket: bucket,
       reasoning
@@ -597,6 +616,7 @@ export class ProviderOrchestrator {
         this.telemetry.logFailure({
           timestamp: Date.now(),
           provider: slot.provider.id,
+          providerScope: slot.telemetryScope,
           errorType: reason,
           shortMessage: error.message.slice(0, 100),
           fullStack: error.stack || error.message,
@@ -744,6 +764,7 @@ export class ProviderOrchestrator {
         this.telemetry.logFailure({
           timestamp: Date.now(),
           provider: slot.provider.id,
+          providerScope: slot.telemetryScope,
           errorType: reason,
           shortMessage: error.message.slice(0, 100),
           fullStack: error.stack || error.message,

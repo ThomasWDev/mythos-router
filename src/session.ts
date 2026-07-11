@@ -1,22 +1,20 @@
 // ─────────────────────────────────────────────────────────────
 //  mythos-router :: session.ts
-//  Session persistence — save/resume conversation state
-//  Single JSON file, atomic writes, versioned format
+//  Workspace-scoped session persistence — atomic, versioned, resumable.
 // ─────────────────────────────────────────────────────────────
 
-import { mkdirSync, writeFileSync, readFileSync, renameSync, existsSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
 import type { Message } from './providers/types.js';
 import { normalizeMessages } from './providers/messages.js';
+import { AtomicFileWriter } from './atomic-writer.js';
+import { resolveWorkspace, type WorkspaceInput } from './workspace.js';
 
 const SESSION_VERSION = 2;
 const LEGACY_SESSION_VERSION = 1;
-const SESSIONS_DIR = join(homedir(), '.mythos-router', 'sessions');
-const SESSION_FILE = join(SESSIONS_DIR, 'latest.json');
-const SESSION_TMP = join(SESSIONS_DIR, 'latest.tmp');
+const SESSION_FILE_NAME = 'latest.json';
+const sessionWriter = new AtomicFileWriter();
 
-// ── Serialized Session Format ────────────────────────────────
 export interface SessionData {
   version: number;
   timestamp: string;
@@ -27,6 +25,12 @@ export interface SessionData {
     outputTokens: number;
     turns: number;
   };
+}
+
+export interface SessionPaths {
+  dir: string;
+  file: string;
+  legacyFile: string;
 }
 
 function isNonNegativeFiniteNumber(value: unknown): value is number {
@@ -43,6 +47,16 @@ function parseBudget(value: unknown): SessionData['budget'] | null {
     inputTokens: budget.inputTokens,
     outputTokens: budget.outputTokens,
     turns: budget.turns,
+  };
+}
+
+export function getSessionPaths(workspaceInput?: WorkspaceInput): SessionPaths {
+  const workspace = resolveWorkspace(workspaceInput);
+  const legacyDir = join(workspace.userStateDir, 'sessions');
+  return {
+    dir: workspace.sessionsDir,
+    file: join(workspace.sessionsDir, SESSION_FILE_NAME),
+    legacyFile: join(legacyDir, SESSION_FILE_NAME),
   };
 }
 
@@ -83,12 +97,13 @@ export function serializeSessionData(data: Omit<SessionData, 'version'>): string
   }, null, 2);
 }
 
-// ── Save Session (atomic write) ──────────────────────────────
 export function saveSession(
   history: Message[],
   budget: { inputTokens: number; outputTokens: number; turns: number },
   project: string,
+  workspaceInput?: WorkspaceInput,
 ): void {
+  const paths = getSessionPaths(workspaceInput);
   const serialized = serializeSessionData({
     timestamp: new Date().toISOString(),
     project,
@@ -96,25 +111,42 @@ export function saveSession(
     budget,
   });
 
-  mkdirSync(SESSIONS_DIR, { recursive: true });
-
-  // Write to tmp first, then atomic rename
-  writeFileSync(SESSION_TMP, serialized, 'utf-8');
-  renameSync(SESSION_TMP, SESSION_FILE);
+  mkdirSync(paths.dir, { recursive: true });
+  sessionWriter.write(paths.file, serialized, {
+    createOnly: false,
+    mode: 0o600,
+  });
 }
 
-// ── Load Session ─────────────────────────────────────────────
-export function loadSession(): SessionData | null {
-  if (!existsSync(SESSION_FILE)) return null;
+export function loadSession(workspaceInput?: WorkspaceInput): SessionData | null {
+  const workspace = resolveWorkspace(workspaceInput);
+  const paths = getSessionPaths(workspace);
+  const scoped = readSessionFile(paths.file);
+  if (scoped) return scoped;
+
+  // One-way compatibility bridge for pre-workspace releases. The old location
+  // was global and keyed only by project basename, so migrate only when that
+  // basename matches the current canonical workspace.
+  const legacy = readSessionFile(paths.legacyFile);
+  if (!legacy || legacy.project !== workspace.projectName) return null;
 
   try {
-    return parseSessionData(readFileSync(SESSION_FILE, 'utf-8'));
+    saveSession(legacy.history, legacy.budget, legacy.project, workspace);
+  } catch {
+    // A read remains useful even when migration cannot be persisted.
+  }
+  return legacy;
+}
+
+function readSessionFile(filePath: string): SessionData | null {
+  if (!existsSync(filePath)) return null;
+  try {
+    return parseSessionData(readFileSync(filePath, 'utf-8'));
   } catch {
     return null;
   }
 }
 
-// ── Format resume info for terminal ──────────────────────────
 export function formatResumeInfo(session: SessionData): string {
   const date = new Date(session.timestamp);
   const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });

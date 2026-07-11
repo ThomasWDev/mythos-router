@@ -22,6 +22,7 @@ import {
   type SkillLearningResult,
 } from '../skill-learning.js';
 import { c, error, heading, hr, info, success, theme, warn } from '../utils.js';
+import { resolveWorkspace } from '../workspace.js';
 
 interface SkillsOptions {
   global?: boolean;
@@ -37,10 +38,11 @@ export async function skillsCommand(
   name?: string,
   options: SkillsOptions = {},
 ): Promise<void> {
+  const workspace = resolveWorkspace();
   const normalizedAction = (action ?? 'list').toLowerCase();
 
   if (normalizedAction === 'list') {
-    printSkillsList(options.json);
+    printSkillsList(options.json, workspace.rootDir);
     return;
   }
 
@@ -50,7 +52,7 @@ export async function skillsCommand(
       process.exitCode = 1;
       return;
     }
-    printSkill(name, options.json);
+    printSkill(name, options.json, workspace.rootDir);
     return;
   }
 
@@ -60,17 +62,17 @@ export async function skillsCommand(
       process.exitCode = 1;
       return;
     }
-    createNewSkill(name, options);
+    createNewSkill(name, options, workspace.rootDir);
     return;
   }
 
   if (normalizedAction === 'check') {
-    printSkillCheck(name, options.json);
+    printSkillCheck(name, options.json, workspace.rootDir);
     return;
   }
 
   if (normalizedAction === 'suggest') {
-    suggestSkillFromReceipts(name, options);
+    suggestSkillFromReceipts(name, options, workspace.rootDir);
     return;
   }
 
@@ -79,8 +81,8 @@ export async function skillsCommand(
   process.exitCode = 1;
 }
 
-function printSkillsList(asJson?: boolean): void {
-  const entries = listSkills();
+function printSkillsList(asJson: boolean | undefined, rootDir: string): void {
+  const entries = listSkills(rootDir);
 
   if (asJson) {
     console.log(JSON.stringify(entries, null, 2));
@@ -88,22 +90,22 @@ function printSkillsList(asJson?: boolean): void {
   }
 
   console.log(heading('Mythos Skills'));
-  console.log(`${c.dim}Project:${c.reset} ${formatPath(getProjectSkillsDir())}`);
-  console.log(`${c.dim}Global:${c.reset}  ${formatPath(getGlobalSkillsDir())}`);
+  console.log(`${c.dim}Project:${c.reset} ${formatPath(getProjectSkillsDir(rootDir), rootDir)}`);
+  console.log(`${c.dim}Global:${c.reset}  ${formatPath(getGlobalSkillsDir(), rootDir)}`);
   console.log();
 
   const project = entries.filter((entry) => entry.scope === 'project');
   const global = entries.filter((entry) => entry.scope === 'global');
 
-  printSkillGroup('Project skills', project);
-  printSkillGroup('Global skills', global);
+  printSkillGroup('Project skills', project, rootDir);
+  printSkillGroup('Global skills', global, rootDir);
 
   if (entries.length === 0) {
     info('No skills found yet. Create one with: mythos skills new repo');
   }
 }
 
-function printSkillGroup(title: string, entries: SkillListEntry[]): void {
+function printSkillGroup(title: string, entries: SkillListEntry[], rootDir: string): void {
   console.log(`${c.bold}${title}${c.reset}`);
   if (entries.length === 0) {
     console.log(`  ${c.dim}none${c.reset}`);
@@ -117,15 +119,15 @@ function printSkillGroup(title: string, entries: SkillListEntry[]): void {
     console.log(
       `  ${theme.info}${entry.id}${c.reset} ${c.dim}v${entry.version}${c.reset}${shadowed}${description}`,
     );
-    console.log(`     ${c.dim}${formatPath(entry.path)}${c.reset}`);
+    console.log(`     ${c.dim}${formatPath(entry.path, rootDir)}${c.reset}`);
   }
   console.log();
 }
 
-function printSkill(name: string, asJson?: boolean): void {
+function printSkill(name: string, asJson: boolean | undefined, rootDir: string): void {
   let skill: Skill;
   try {
-    skill = loadSkill(name);
+    skill = loadSkill(name, rootDir);
   } catch (err) {
     error(err instanceof Error ? err.message : String(err));
     process.exitCode = 1;
@@ -141,7 +143,7 @@ function printSkill(name: string, asJson?: boolean): void {
   console.log(`${c.dim}Name:${c.reset}        ${skill.meta.name}`);
   console.log(`${c.dim}Version:${c.reset}     ${skill.meta.version}`);
   console.log(`${c.dim}Source:${c.reset}      ${skill.scope}`);
-  console.log(`${c.dim}Path:${c.reset}        ${formatPath(skill.filePath)}`);
+  console.log(`${c.dim}Path:${c.reset}        ${formatPath(skill.filePath, rootDir)}`);
   console.log(`${c.dim}Priority:${c.reset}    ${skill.meta.priority}`);
   console.log(`${c.dim}Budget:${c.reset}      ${skill.meta.budgetMultiplier}x`);
   console.log(`${c.dim}Fallback:${c.reset}    ${skill.meta.allowFallback ? 'allowed' : 'disabled'}`);
@@ -156,10 +158,10 @@ function printSkill(name: string, asJson?: boolean): void {
   console.log(skill.instructions || `${c.dim}(empty)${c.reset}`);
 }
 
-function createNewSkill(name: string, options: SkillsOptions): void {
+function createNewSkill(name: string, options: SkillsOptions, rootDir: string): void {
   try {
     const scope = options.global ? 'global' : 'project';
-    const skill = createSkill(name, { scope, force: options.force });
+    const skill = createSkill(name, { scope, force: options.force, cwd: rootDir });
 
     if (options.json) {
       console.log(JSON.stringify(skill, null, 2));
@@ -167,7 +169,7 @@ function createNewSkill(name: string, options: SkillsOptions): void {
     }
 
     success(`Created ${scope} skill: ${skill.id}`);
-    console.log(`  ${c.dim}${formatPath(skill.filePath)}${c.reset}`);
+    console.log(`  ${c.dim}${formatPath(skill.filePath, rootDir)}${c.reset}`);
     console.log();
     console.log(`${c.dim}Use it:${c.reset} mythos run --file TASK.md -s ${skill.id}`);
   } catch (err) {
@@ -176,8 +178,8 @@ function createNewSkill(name: string, options: SkillsOptions): void {
   }
 }
 
-function printSkillCheck(name?: string, asJson?: boolean): void {
-  const result = checkSkills(name);
+function printSkillCheck(name: string | undefined, asJson: boolean | undefined, rootDir: string): void {
+  const result = checkSkills(name, rootDir);
 
   if (asJson) {
     console.log(JSON.stringify(result, null, 2));
@@ -197,7 +199,7 @@ function printSkillCheck(name?: string, asJson?: boolean): void {
   }
 
   for (const issue of result.issues) {
-    printIssue(issue);
+    printIssue(issue, rootDir);
   }
 
   console.log();
@@ -209,22 +211,22 @@ function printSkillCheck(name?: string, asJson?: boolean): void {
   }
 }
 
-function printIssue(issue: SkillCheckIssue): void {
+function printIssue(issue: SkillCheckIssue, rootDir: string): void {
   const label = issue.level === 'error'
     ? `${theme.error}ERROR${c.reset}`
     : `${theme.warning}WARN${c.reset}`;
-  console.log(`  ${label} ${c.bold}${issue.scope}${c.reset} ${formatPath(issue.path)}`);
+  console.log(`  ${label} ${c.bold}${issue.scope}${c.reset} ${formatPath(issue.path, rootDir)}`);
   console.log(`       ${c.dim}${issue.message}${c.reset}`);
 }
 
-function suggestSkillFromReceipts(name: string | undefined, options: SkillsOptions): void {
+function suggestSkillFromReceipts(name: string | undefined, options: SkillsOptions, rootDir: string): void {
   const limit = parsePositiveOption(options.limit, 50);
   const minOccurrences = parsePositiveOption(options.minOccurrences, 2);
   const skillName = (name && name.trim()) || DEFAULT_LEARNED_SKILL_NAME;
 
   let receipts;
   try {
-    receipts = readReceipts(limit);
+    receipts = readReceipts(limit, rootDir);
   } catch (err) {
     error(err instanceof Error ? err.message : String(err));
     process.exitCode = 1;
@@ -234,7 +236,7 @@ function suggestSkillFromReceipts(name: string | undefined, options: SkillsOptio
   const result = analyzeReceiptsForSkill(receipts, { minOccurrences, skillName });
 
   if (options.write) {
-    writeLearnedSkill(result, options, skillName);
+    writeLearnedSkill(result, options, skillName, rootDir);
     return;
   }
 
@@ -246,7 +248,12 @@ function suggestSkillFromReceipts(name: string | undefined, options: SkillsOptio
   printSkillSuggestions(result);
 }
 
-function writeLearnedSkill(result: SkillLearningResult, options: SkillsOptions, skillName: string): void {
+function writeLearnedSkill(
+  result: SkillLearningResult,
+  options: SkillsOptions,
+  skillName: string,
+  rootDir: string,
+): void {
   if (!result.skillMarkdown) {
     if (options.json) {
       console.log(JSON.stringify({ ...result, written: null }, null, 2));
@@ -263,13 +270,13 @@ function writeLearnedSkill(result: SkillLearningResult, options: SkillsOptions, 
   }
 
   const scope = options.global ? 'global' : 'project';
-  const root = ensureSkillsDir(scope);
+  const root = ensureSkillsDir(scope, rootDir);
   const dir = path.join(root, skillName);
   const filePath = path.join(dir, 'SKILL.md');
   const exists = fs.existsSync(filePath);
 
   if (exists && !options.force) {
-    error(`Skill already exists: ${formatPath(filePath)}. Re-run with --force to overwrite.`);
+    error(`Skill already exists: ${formatPath(filePath, rootDir)}. Re-run with --force to overwrite.`);
     process.exitCode = 1;
     return;
   }
@@ -278,7 +285,7 @@ function writeLearnedSkill(result: SkillLearningResult, options: SkillsOptions, 
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(filePath, result.skillMarkdown, 'utf-8');
     // Confirm the generated file parses and validates like a hand-authored skill.
-    const errors = validateSkill(loadSkill(filePath)).filter((issue) => issue.level === 'error');
+    const errors = validateSkill(loadSkill(filePath, rootDir)).filter((issue) => issue.level === 'error');
     if (errors.length > 0) {
       error(`Generated skill failed validation: ${errors.map((issue) => issue.message).join('; ')}`);
       process.exitCode = 1;
@@ -297,7 +304,7 @@ function writeLearnedSkill(result: SkillLearningResult, options: SkillsOptions, 
   }
 
   success(`${action === 'created' ? 'Created' : 'Updated'} ${scope} skill: ${skillName}`);
-  console.log(`  ${c.dim}${formatPath(filePath)}${c.reset}`);
+  console.log(`  ${c.dim}${formatPath(filePath, rootDir)}${c.reset}`);
   console.log();
   console.log(`${c.dim}Load it:${c.reset} mythos run --file TASK.md -s ${skillName}`);
 }
@@ -339,13 +346,13 @@ function parsePositiveOption(value: string | undefined, fallback: number): numbe
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function formatPath(filePath: string): string {
+function formatPath(filePath: string, rootDir = process.cwd()): string {
   const home = os.homedir();
   if (filePath === home || filePath.startsWith(home + path.sep)) {
     return '~' + filePath.slice(home.length);
   }
 
-  const relative = path.relative(process.cwd(), filePath);
+  const relative = path.relative(rootDir, filePath);
   const escapesCwd = relative === '..' || relative.startsWith(`..${path.sep}`);
   if (relative && !escapesCwd && !path.isAbsolute(relative)) {
     return relative || '.';

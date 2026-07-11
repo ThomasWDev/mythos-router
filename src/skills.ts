@@ -282,8 +282,8 @@ function skillIdFromPath(skillPath: string): string {
   return parent && parent !== '.' ? parent : path.basename(skillPath, path.extname(skillPath));
 }
 
-function resolvePathLikeSkill(nameOrPath: string): string {
-  const resolved = path.resolve(nameOrPath);
+function resolvePathLikeSkill(nameOrPath: string, cwd: string): string {
+  const resolved = path.resolve(cwd, nameOrPath);
 
   if (fs.existsSync(resolved)) {
     const stat = fs.statSync(resolved);
@@ -297,8 +297,8 @@ function resolvePathLikeSkill(nameOrPath: string): string {
   return path.join(resolved, SKILL_FILE);
 }
 
-function resolveNamedSkill(name: string): { filePath: string; scope: Exclude<SkillScope, 'path'> } | null {
-  const projectPath = path.join(getProjectSkillsDir(), name, SKILL_FILE);
+function resolveNamedSkill(name: string, cwd: string): { filePath: string; scope: Exclude<SkillScope, 'path'> } | null {
+  const projectPath = path.join(getProjectSkillsDir(cwd), name, SKILL_FILE);
   if (fs.existsSync(projectPath)) return { filePath: projectPath, scope: 'project' };
 
   const globalPath = path.join(getGlobalSkillsDir(), name, SKILL_FILE);
@@ -341,17 +341,17 @@ function readSkillFile(filePath: string, scope: SkillScope, id = skillIdFromPath
   return parseSkillContent(fs.readFileSync(filePath, 'utf-8'), { id, filePath, scope });
 }
 
-export function loadSkill(nameOrPath: string): Skill {
+export function loadSkill(nameOrPath: string, cwd = process.cwd()): Skill {
   if (isPathLike(nameOrPath)) {
-    const skillPath = resolvePathLikeSkill(nameOrPath);
+    const skillPath = resolvePathLikeSkill(nameOrPath, cwd);
     return readSkillFile(skillPath, 'path');
   }
 
-  const resolved = resolveNamedSkill(nameOrPath);
+  const resolved = resolveNamedSkill(nameOrPath, cwd);
   if (!resolved) {
     throw new Error(
       `Skill not found: ${nameOrPath}\n` +
-      `  Project: ${path.join(getProjectSkillsDir(), nameOrPath, SKILL_FILE)}\n` +
+      `  Project: ${path.join(getProjectSkillsDir(cwd), nameOrPath, SKILL_FILE)}\n` +
       `  Global:  ${path.join(getGlobalSkillsDir(), nameOrPath, SKILL_FILE)}\n` +
       `  Create:  mythos skills new ${nameOrPath}`,
     );
@@ -360,8 +360,8 @@ export function loadSkill(nameOrPath: string): Skill {
   return readSkillFile(resolved.filePath, resolved.scope, nameOrPath);
 }
 
-function listSkillFiles(scope: Exclude<SkillScope, 'path'>): Array<{ id: string; filePath: string; scope: Exclude<SkillScope, 'path'> }> {
-  const root = scope === 'project' ? getProjectSkillsDir() : getGlobalSkillsDir();
+function listSkillFiles(scope: Exclude<SkillScope, 'path'>, cwd = process.cwd()): Array<{ id: string; filePath: string; scope: Exclude<SkillScope, 'path'> }> {
+  const root = scope === 'project' ? getProjectSkillsDir(cwd) : getGlobalSkillsDir();
   if (!fs.existsSync(root)) return [];
 
   return fs.readdirSync(root, { withFileTypes: true })
@@ -374,9 +374,9 @@ function listSkillFiles(scope: Exclude<SkillScope, 'path'>): Array<{ id: string;
     .filter((entry) => fs.existsSync(entry.filePath));
 }
 
-export function listSkills(): SkillListEntry[] {
-  const projectFiles = listSkillFiles('project');
-  const globalFiles = listSkillFiles('global');
+export function listSkills(cwd = process.cwd()): SkillListEntry[] {
+  const projectFiles = listSkillFiles('project', cwd);
+  const globalFiles = listSkillFiles('global', cwd);
   const projectIds = new Set(projectFiles.map((entry) => entry.id));
   const entries: SkillListEntry[] = [];
 
@@ -430,13 +430,13 @@ export function validateSkill(skill: Skill): SkillCheckIssue[] {
   return issues;
 }
 
-export function checkSkills(nameOrPath?: string): SkillCheckResult {
+export function checkSkills(nameOrPath?: string, cwd = process.cwd()): SkillCheckResult {
   const skills: Skill[] = [];
   const issues: SkillCheckIssue[] = [];
 
   if (nameOrPath) {
     try {
-      skills.push(loadSkill(nameOrPath));
+      skills.push(loadSkill(nameOrPath, cwd));
     } catch (err) {
       issues.push({
         level: 'error',
@@ -446,7 +446,7 @@ export function checkSkills(nameOrPath?: string): SkillCheckResult {
       });
     }
   } else {
-    for (const entry of [...listSkillFiles('project'), ...listSkillFiles('global')]) {
+    for (const entry of [...listSkillFiles('project', cwd), ...listSkillFiles('global', cwd)]) {
       try {
         skills.push(readSkillFile(entry.filePath, entry.scope, entry.id));
       } catch (err) {
@@ -485,7 +485,7 @@ export function checkSkills(nameOrPath?: string): SkillCheckResult {
   };
 }
 
-export function validateSkills(skillNames: string[]): SkillValidation {
+export function validateSkills(skillNames: string[], cwd = process.cwd()): SkillValidation {
   const errors: string[] = [];
   const loaded: Skill[] = [];
 
@@ -534,7 +534,7 @@ export function validateSkills(skillNames: string[]): SkillValidation {
   return { valid: errors.length === 0, errors };
 }
 
-export function buildSkillPrompt(basePrompt: string, skillNames: string[]): {
+export function buildSkillPrompt(basePrompt: string, skillNames: string[], cwd = process.cwd()): {
   prompt: string;
   skills: Skill[];
   budgetMultiplier: number;
@@ -547,12 +547,12 @@ export function buildSkillPrompt(basePrompt: string, skillNames: string[]): {
     return { prompt: basePrompt, skills: [], budgetMultiplier: 1.0 };
   }
 
-  const validation = validateSkills(skillNames);
+  const validation = validateSkills(skillNames, cwd);
   if (!validation.valid) {
     throw new Error(`Skill validation failed:\n${validation.errors.map((error) => `  - ${error}`).join('\n')}`);
   }
 
-  const skills = skillNames.map((name) => loadSkill(name));
+  const skills = skillNames.map((name) => loadSkill(name, cwd));
   skills.sort((a, b) => b.meta.priority - a.meta.priority);
 
   const skillBlocks = skills.map((skill) =>

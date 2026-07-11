@@ -98,11 +98,11 @@ export function classifyActionRisk(action: FileAction, policyState: ProjectPolic
   };
 }
 
-export function reviewActions(actions: FileAction[]): PolicyReview {
+export function reviewActions(actions: FileAction[], rootDir = process.cwd()): PolicyReview {
   const approved: FileAction[] = [];
   const blocked: PolicyReview['blocked'] = [];
   const needsConfirmation: PolicyReview['needsConfirmation'] = [];
-  const policyState = loadProjectPolicy();
+  const policyState = loadProjectPolicy(rootDir);
   const batchDecision = evaluateProjectPolicyBatch(actions, policyState);
 
   if (batchDecision) {

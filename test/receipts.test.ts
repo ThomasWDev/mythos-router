@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -11,6 +11,7 @@ import {
   saveSWDReceipt,
   verifyReceipt,
   verifyReceiptIntegrity,
+  verifyReceiptChain,
   sanitizeReceiptOutputTail,
   RECEIPT_OUTPUT_TAIL_MAX_CHARS,
 } from '../src/receipts.js';
@@ -145,6 +146,31 @@ describe('SWD receipts', () => {
     assert.equal(readReceipt(receipt.id)?.id, receipt.id);
   });
 
+
+  it('does not follow symlinked receipt files during reads or chain verification', (t) => {
+    const receipt = createSWDReceipt({
+      request: 'receipt symlink',
+      summary: 'receipt symlink',
+      result: { success: true, rolledBack: false, rollbackErrors: [], errors: [], results: [] },
+    });
+    const savedPath = saveSWDReceipt(receipt);
+    const outsideReceipt = join(tempDir, 'outside-receipt.json');
+    writeFileSync(outsideReceipt, readFileSync(savedPath, 'utf8'));
+    const linkedId = 'swd-linked-receipt';
+    const linkedPath = join(tempDir, '.mythos', 'receipts', `${linkedId}.json`);
+    try {
+      symlinkSync(outsideReceipt, linkedPath, 'file');
+    } catch {
+      t.skip('File symlinks are not available in this environment');
+      return;
+    }
+
+    assert.equal(readReceipt(linkedId), null);
+    const chain = verifyReceiptChain();
+    assert.equal(chain.ok, false);
+    assert.match(chain.reason ?? '', /unreadable|invalid JSON/i);
+  });
+
   it('normalizes receipt paths even when cwd is a symlinked project root', (t) => {
     const filePath = 'linked-root.txt';
     const absPath = join(tempDir, filePath);
@@ -259,6 +285,199 @@ describe('SWD receipts', () => {
     assert.equal(verification.files[0]!.status, 'drifted');
   });
 
+
+  it('treats existing receipt ids as append-only while allowing idempotent re-save', () => {
+    const receipt = createSWDReceipt({
+      request: 'append only',
+      summary: 'append only',
+      result: { success: true, rolledBack: false, rollbackErrors: [], errors: [], results: [] },
+    });
+
+    const firstPath = saveSWDReceipt(receipt);
+    const firstBytes = readFileSync(firstPath, 'utf8');
+    assert.equal(saveSWDReceipt(receipt), firstPath);
+    assert.equal(readFileSync(firstPath, 'utf8'), firstBytes);
+
+    receipt.summary = 'attempted rewrite';
+    assert.throws(() => saveSWDReceipt(receipt), /append-only|overwrite existing receipt/i);
+    assert.equal(readFileSync(firstPath, 'utf8'), firstBytes);
+  });
+
+  it('rejects unsafe receipt ids before constructing a store path', () => {
+    const receipt = createSWDReceipt({
+      request: 'unsafe id',
+      summary: 'unsafe id',
+      result: { success: true, rolledBack: false, rollbackErrors: [], errors: [], results: [] },
+    });
+    receipt.id = '../../outside';
+
+    assert.throws(() => saveSWDReceipt(receipt), /invalid receipt id/i);
+    assert.equal(readdirSync(tempDir).includes('outside.json'), false);
+  });
+
+  it('refuses to use a symlinked receipts directory', (t) => {
+    const outside = mkdtempSync(join(tmpdir(), 'mythos-receipts-outside-'));
+    mkdirSync(join(tempDir, '.mythos'));
+    try {
+      symlinkSync(outside, join(tempDir, '.mythos', 'receipts'), process.platform === 'win32' ? 'junction' : 'dir');
+    } catch {
+      rmSync(outside, { recursive: true, force: true });
+      t.skip('Directory symlinks are not available in this environment');
+      return;
+    }
+
+    try {
+      const receipt = createSWDReceipt({
+        request: 'store jail',
+        summary: 'store jail',
+        result: { success: true, rolledBack: false, rollbackErrors: [], errors: [], results: [] },
+      });
+      assert.throws(() => saveSWDReceipt(receipt), /SECURITY VIOLATION|symlink/i);
+      assert.deepEqual(readdirSync(outside), []);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('checks receipt integrity before resolving or opening referenced paths', () => {
+    const outside = join(tempDir, '..', `outside-${Date.now()}.txt`);
+    writeFileSync(outside, 'secret outside content', 'utf8');
+    try {
+      const receipt = createSWDReceipt({
+        request: 'integrity first',
+        summary: 'integrity first',
+        result: { success: true, rolledBack: false, rollbackErrors: [], errors: [], results: [] },
+      });
+      receipt.files = [{
+        path: outside,
+        operation: 'MODIFY',
+        intent: 'MUTATE',
+        status: 'verified',
+        detail: 'malicious path',
+        expectedSource: 'after',
+        expected: {
+          path: outside,
+          exists: true,
+          size: 22,
+          mtime: 1,
+          sha256: sha256('secret outside content'),
+        },
+      }];
+      // Deliberately leave the old integrity hash in place.
+      const verification = verifyReceipt(receipt);
+      assert.equal(verification.integrityOk, false);
+      assert.equal(verification.ok, false);
+      assert.equal(verification.files[0]!.status, 'unknown');
+      assert.match(verification.files[0]!.detail, /were not opened/i);
+    } finally {
+      rmSync(outside, { force: true });
+    }
+  });
+
+  it('rejects a self-consistent receipt path that escapes the project', () => {
+    const outside = join(tempDir, '..', `outside-${Date.now()}.txt`);
+    writeFileSync(outside, 'outside', 'utf8');
+    try {
+      const receipt = createSWDReceipt({
+        request: 'path jail',
+        summary: 'path jail',
+        result: { success: true, rolledBack: false, rollbackErrors: [], errors: [], results: [] },
+      });
+      receipt.files = [{
+        path: '../outside.txt',
+        operation: 'MODIFY',
+        intent: 'MUTATE',
+        status: 'verified',
+        detail: 'malicious path',
+        expectedSource: 'after',
+        expected: {
+          path: '../outside.txt',
+          exists: true,
+          size: 7,
+          mtime: 1,
+          sha256: sha256('outside'),
+        },
+      }];
+      rehashReceipt(receipt);
+
+      const verification = verifyReceipt(receipt);
+      assert.equal(verification.integrityOk, true);
+      assert.equal(verification.ok, false);
+      assert.equal(verification.files[0]!.status, 'unknown');
+      assert.match(verification.files[0]!.detail, /SECURITY VIOLATION|path traversal/i);
+    } finally {
+      rmSync(outside, { force: true });
+    }
+  });
+
+  it('refuses to hash a receipt target reached through a symlink', (t) => {
+    const outside = join(tempDir, '..', `outside-${Date.now()}.txt`);
+    const link = join(tempDir, 'linked.txt');
+    writeFileSync(outside, 'outside', 'utf8');
+    try {
+      symlinkSync(outside, link, 'file');
+    } catch {
+      rmSync(outside, { force: true });
+      t.skip('File symlinks are not available in this environment');
+      return;
+    }
+
+    try {
+      const receipt = createSWDReceipt({
+        request: 'symlink target',
+        summary: 'symlink target',
+        result: {
+          success: true,
+          rolledBack: false,
+          rollbackErrors: [],
+          errors: [],
+          results: [{
+            action: { path: 'linked.txt', operation: 'MODIFY', intent: 'MUTATE', description: 'linked' },
+            status: 'verified',
+            detail: 'linked',
+            after: { path: link, exists: true, size: 7, mtime: 1, hash: sha256('outside') },
+          }],
+        },
+      });
+
+      const verification = verifyReceipt(receipt);
+      assert.equal(verification.integrityOk, true);
+      assert.equal(verification.ok, false);
+      assert.equal(verification.files[0]!.status, 'unknown');
+      assert.match(verification.files[0]!.detail, /symlink|path traversal|SECURITY VIOLATION/i);
+    } finally {
+      rmSync(outside, { force: true });
+    }
+  });
+
+  it('streams large-file hashes without changing verification semantics', () => {
+    const content = Buffer.alloc(8 * 1024 * 1024, 0x61);
+    const filePath = 'large.bin';
+    const absPath = join(tempDir, filePath);
+    writeFileSync(absPath, content);
+
+    const receipt = createSWDReceipt({
+      request: 'verify large file',
+      summary: 'MODIFY: large.bin',
+      result: {
+        success: true,
+        rolledBack: false,
+        rollbackErrors: [],
+        errors: [],
+        results: [{
+          action: { path: filePath, operation: 'MODIFY', intent: 'MUTATE', description: 'large' },
+          status: 'verified',
+          detail: 'large',
+          after: { path: absPath, exists: true, size: content.length, mtime: 1, hash: createHash('sha256').update(content).digest('hex') },
+        }],
+      },
+    });
+
+    const verification = verifyReceipt(receipt);
+    assert.equal(verification.integrityOk, true);
+    assert.equal(verification.ok, true);
+  });
+
   it('sanitizes receipt test output tails before storage', () => {
     const longPrefix = 'a'.repeat(RECEIPT_OUTPUT_TAIL_MAX_CHARS + 25);
     const output = `${longPrefix}
@@ -361,4 +580,9 @@ Authorization: Bearer ${'y'.repeat(40)}
 
 function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex');
+}
+
+function rehashReceipt(receipt: import('../src/receipts.js').SWDReceipt): void {
+  const { integrity: _integrity, ...payload } = receipt;
+  receipt.integrity = { sha256: createHash('sha256').update(JSON.stringify(payload)).digest('hex') };
 }

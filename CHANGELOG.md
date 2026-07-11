@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.23.0] - 2026.07.11
+
+### Added
+
+- Persistent SWD transaction journals with conservative crash recovery through `mythos doctor --repair`.
+- `mythos doctor` workspace diagnostics with JSON output for policies, receipts, sessions, telemetry, filesystem safety, and interrupted transactions.
+- Ignore-aware, secret-filtered sandbox workspace mirroring.
+- Workspace/provider/model/endpoint-scoped telemetry persistence and startup hydration.
+- Source-only coverage thresholds and an installed-package/CLI smoke test in CI.
+
+### Changed
+
+- Provider telemetry is isolated by canonical workspace and provider endpoint identity.
+- Sandbox checks now honor `.gitignore` and `.mythosignore` while excluding common credential material by default.
+
+---
+
 ## [1.22.1] - 2026-07-03
 
 ### Fixed
@@ -523,6 +540,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Correction Turns** — max 2 retries before yielding to human.
 - **Dream/Verify Commands** — memory compression and drift detection.
 
+[1.23.0]: https://github.com/thewaltero/mythos-router/releases/tag/v1.23.0
 [1.22.1]: https://github.com/thewaltero/mythos-router/releases/tag/v1.22.1
 [1.21.0]: https://github.com/thewaltero/mythos-router/releases/tag/v1.21.0
 [1.20.0]: https://github.com/thewaltero/mythos-router/releases/tag/v1.20.0

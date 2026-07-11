@@ -1,8 +1,8 @@
 import {
+  getReceiptsDir,
   listReceipts,
   readReceipt,
   verifyReceipt,
-  verifyReceiptIntegrity,
   verifyReceiptChain,
   type ReceiptSummary,
   type SWDReceipt,
@@ -10,6 +10,7 @@ import {
 import { planUndo, executeUndo, type UndoPlan, type UndoExecution } from '../receipt-undo.js';
 import { formatReceiptMarkdown } from '../receipt-markdown.js';
 import { c, error, heading, hr, info, success, theme, warn } from '../utils.js';
+import { resolveWorkspace } from '../workspace.js';
 
 interface ReceiptsOptions {
   limit?: string;
@@ -26,6 +27,7 @@ export async function receiptsCommand(
   target?: string,
   options: ReceiptsOptions = {},
 ): Promise<void> {
+  const workspace = resolveWorkspace();
   const normalizedAction = (action ?? 'list').toLowerCase();
   if (options.format && options.format !== 'json' && options.format !== 'markdown') {
     error('Receipt format must be json or markdown.');
@@ -34,31 +36,31 @@ export async function receiptsCommand(
   }
 
   if (normalizedAction === 'list') {
-    printReceiptList(parseLimit(options.limit), wantsJson(options));
+    printReceiptList(parseLimit(options.limit), wantsJson(options), workspace.rootDir);
     return;
   }
 
   if (normalizedAction === 'latest') {
-    printReceipt('latest', options);
+    printReceipt('latest', options, workspace.rootDir);
     return;
   }
 
   if (normalizedAction === 'show') {
-    printReceipt(target ?? 'latest', options);
+    printReceipt(target ?? 'latest', options, workspace.rootDir);
     return;
   }
 
   if (normalizedAction === 'verify') {
     if (target) {
-      printReceiptVerification(target, wantsJson(options));
+      printReceiptVerification(target, wantsJson(options), workspace.rootDir);
     } else {
-      verifyAllReceipts(wantsJson(options));
+      verifyAllReceipts(wantsJson(options), workspace.rootDir);
     }
     return;
   }
 
   if (normalizedAction === 'undo') {
-    await runReceiptUndo(target ?? 'latest', options);
+    await runReceiptUndo(target ?? 'latest', options, workspace.rootDir);
     return;
   }
 
@@ -66,8 +68,8 @@ export async function receiptsCommand(
   info('Usage: mythos receipts | mythos receipts show latest [--markdown|--format markdown] | mythos receipts verify latest | mythos receipts undo latest [--yes]');
 }
 
-function printReceiptList(limit: number, asJson?: boolean): void {
-  const receipts = listReceipts(limit);
+function printReceiptList(limit: number, asJson: boolean | undefined, rootDir: string): void {
+  const receipts = listReceipts(limit, rootDir);
 
   if (asJson) {
     console.log(JSON.stringify(receipts, null, 2));
@@ -95,8 +97,8 @@ function printReceiptList(limit: number, asJson?: boolean): void {
   }
 }
 
-function printReceipt(target: string, options: ReceiptsOptions = {}): void {
-  const receipt = readReceipt(target);
+function printReceipt(target: string, options: ReceiptsOptions, rootDir: string): void {
+  const receipt = readReceipt(target, rootDir);
   if (!receipt) {
     error(`Receipt not found: ${target}`);
     return;
@@ -128,16 +130,16 @@ function printReceipt(target: string, options: ReceiptsOptions = {}): void {
   }
 }
 
-function printReceiptVerification(target: string, asJson?: boolean): boolean {
-  const receipt = readReceipt(target);
+function printReceiptVerification(target: string, asJson: boolean | undefined, rootDir: string): boolean {
+  const receipt = readReceipt(target, rootDir);
   if (!receipt) {
     error(`Receipt not found: ${target}`);
     process.exitCode = 1;
     return false;
   }
 
-  const verification = verifyReceipt(receipt);
-  const integrityOk = verifyReceiptIntegrity(receipt);
+  const verification = verifyReceipt(receipt, rootDir);
+  const integrityOk = verification.integrityOk;
   const passed = verification.ok && integrityOk;
   // Fail closed: a verify that can't fail a script is worthless for CI.
   if (!passed) process.exitCode = 1;
@@ -176,8 +178,8 @@ function printReceiptVerification(target: string, asJson?: boolean): boolean {
   return passed;
 }
 
-function verifyAllReceipts(asJson?: boolean): void {
-  const receipts = listReceipts(Number.MAX_SAFE_INTEGER);
+function verifyAllReceipts(asJson: boolean | undefined, rootDir: string): void {
+  const receipts = listReceipts(Number.MAX_SAFE_INTEGER, rootDir);
 
   if (receipts.length === 0) {
     if (asJson) {
@@ -190,15 +192,15 @@ function verifyAllReceipts(asJson?: boolean): void {
 
   if (asJson) {
     const results = receipts.map((summary) => {
-      const receipt = readReceipt(summary.id);
+      const receipt = readReceipt(summary.id, rootDir);
       if (!receipt) {
         return { id: summary.id, ok: false, integrityOk: false, error: 'unreadable' };
       }
-      const verification = verifyReceipt(receipt);
-      const integrityOk = verifyReceiptIntegrity(receipt);
+      const verification = verifyReceipt(receipt, rootDir);
+      const integrityOk = verification.integrityOk;
       return { id: receipt.id, ok: verification.ok, integrityOk, files: verification.files };
     });
-    const chain = verifyReceiptChain();
+    const chain = verifyReceiptChain(getReceiptsDir(rootDir));
     const allOk = results.every((r) => r.ok && r.integrityOk) && chain.ok;
     if (!allOk) process.exitCode = 1;
     console.log(JSON.stringify({ count: results.length, ok: allOk, chain, receipts: results }, null, 2));
@@ -208,14 +210,14 @@ function verifyAllReceipts(asJson?: boolean): void {
   console.log(heading(`Verify ${receipts.length} receipt(s)`));
   let failed = 0;
   for (const summary of receipts) {
-    const passed = printReceiptVerification(summary.id, false);
+    const passed = printReceiptVerification(summary.id, false, rootDir);
     if (!passed) failed += 1;
     console.log(hr());
   }
 
-  // Chain-level verification: catches deletion, reordering, and forgery that
+  // Chain-level verification: catches local gaps, forks, duplicates, and broken links that
   // per-receipt integrity alone cannot.
-  const chain = verifyReceiptChain();
+  const chain = verifyReceiptChain(getReceiptsDir(rootDir));
   if (chain.present) {
     if (chain.ok) {
       success(`Receipt chain intact (${chain.length} linked receipt(s)).`);
@@ -232,8 +234,8 @@ function verifyAllReceipts(asJson?: boolean): void {
   }
 }
 
-async function runReceiptUndo(target: string, options: ReceiptsOptions): Promise<void> {
-  const receipt = readReceipt(target);
+async function runReceiptUndo(target: string, options: ReceiptsOptions, rootDir: string): Promise<void> {
+  const receipt = readReceipt(target, rootDir);
   if (!receipt) {
     error(`Receipt not found: ${target}`);
     process.exitCode = 1;
@@ -242,7 +244,7 @@ async function runReceiptUndo(target: string, options: ReceiptsOptions): Promise
 
   const apply = options.yes === true;
   const force = options.force === true;
-  const plan = planUndo(receipt, { force });
+  const plan = planUndo(receipt, { force, workspace: rootDir });
 
   if (!plan.integrityOk && !force) {
     if (wantsJson(options)) {
@@ -259,7 +261,7 @@ async function runReceiptUndo(target: string, options: ReceiptsOptions): Promise
     warn(`Receipt ${plan.receiptId} was already rolled back; there is likely nothing to undo.`);
   }
 
-  const execution = await executeUndo(plan, { apply });
+  const execution = await executeUndo(plan, { apply, workspace: rootDir });
 
   if (wantsJson(options)) {
     console.log(JSON.stringify({ ...plan, execution }, null, 2));

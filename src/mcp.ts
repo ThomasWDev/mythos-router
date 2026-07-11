@@ -18,6 +18,7 @@ import {
   getProjectSkillsDir,
   listSkills,
 } from './skills.js';
+import { resolveWorkspace, type WorkspaceContext, type WorkspaceInput } from './workspace.js';
 
 export const MCP_PROTOCOL_VERSION = '2025-06-18';
 
@@ -78,7 +79,7 @@ type ToolResult = {
   isError?: boolean;
 };
 
-type ToolHandler = (args: Record<string, unknown>) => Promise<ToolResult> | ToolResult;
+type ToolHandler = (args: Record<string, unknown>, workspace: WorkspaceContext) => Promise<ToolResult> | ToolResult;
 
 const textInputSchema: Record<string, Record<string, unknown>> = {
   input: {
@@ -319,7 +320,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     return toolResult(output, !output.ok);
   },
 
-  swd_dry_run: async (args) => {
+  swd_dry_run: async (args, workspace) => {
     const rawInput = externalAgentInputFromArgs(args);
     const output = await applyExternalAgentActions({
       rawInput,
@@ -330,17 +331,18 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
       summary: optionalString(args.summary, 'summary'),
       agentId: optionalString(args.agentId, 'agentId'),
       modelId: optionalString(args.modelId, 'modelId'),
+      workspace,
     });
     return toolResult(output, !output.ok);
   },
 
-  swd_apply: async (args) => {
+  swd_apply: async (args, workspace) => {
     const rawInput = externalAgentInputFromArgs(args);
     const dryRun = optionalBoolean(args.dryRun, 'dryRun') ?? false;
     const checks = dryRun ? [] : resolveSandboxChecks({
       check: optionalStringArray(args.check, 'check'),
       runChecks: optionalBoolean(args.runChecks, 'runChecks') ?? false,
-    });
+    }, workspace);
     const output = await applyExternalAgentActions({
       rawInput,
       dryRun,
@@ -353,25 +355,26 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
       agentId: optionalString(args.agentId, 'agentId'),
       modelId: optionalString(args.modelId, 'modelId'),
       checks,
+      workspace,
     });
     return toolResult(output, !output.ok);
   },
 
-  receipts_list: (args) => {
+  receipts_list: (args, workspace) => {
     const limit = boundedLimit(args.limit);
     return toolResult({
       ok: true,
-      receipts: listReceipts(limit),
+      receipts: listReceipts(limit, workspace.rootDir),
     });
   },
 
-  receipts_show: (args) => {
+  receipts_show: (args, workspace) => {
     const target = optionalString(args.target, 'target') ?? 'latest';
     const format = optionalString(args.format, 'format') ?? 'json';
     if (format !== 'json' && format !== 'markdown') {
       throw new Error('format must be json or markdown.');
     }
-    const receipt = readReceipt(target);
+    const receipt = readReceipt(target, workspace.rootDir);
     if (!receipt) {
       return toolError(`Receipt not found: ${target}`, { target });
     }
@@ -391,13 +394,13 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     return toolResult({ ok: true, receipt });
   },
 
-  receipts_verify: (args) => {
+  receipts_verify: (args, workspace) => {
     const target = optionalString(args.target, 'target') ?? 'latest';
-    const receipt = readReceipt(target);
+    const receipt = readReceipt(target, workspace.rootDir);
     if (!receipt) {
       return toolError(`Receipt not found: ${target}`, { target });
     }
-    const verification = verifyReceipt(receipt);
+    const verification = verifyReceipt(receipt, workspace.rootDir);
     const integrityOk = verifyReceiptIntegrity(receipt);
     return toolResult({
       ok: verification.ok && integrityOk,
@@ -407,21 +410,22 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     }, !(verification.ok && integrityOk));
   },
 
-  skills_list: () => toolResult({
+  skills_list: (_args, workspace) => toolResult({
     ok: true,
-    projectDir: getProjectSkillsDir(),
+    projectDir: getProjectSkillsDir(workspace.rootDir),
     globalDir: getGlobalSkillsDir(),
-    skills: listSkills(),
+    skills: listSkills(workspace.rootDir),
   }),
 
-  skills_check: (args) => {
+  skills_check: (args, workspace) => {
     const name = optionalString(args.name, 'name');
-    const result = checkSkills(name);
+    const result = checkSkills(name, workspace.rootDir);
     return toolResult({ ok: result.ok, result }, !result.ok);
   },
 };
 
-export async function handleMCPMessage(message: unknown): Promise<JsonRpcResponse | null> {
+export async function handleMCPMessage(message: unknown, workspaceInput?: WorkspaceInput): Promise<JsonRpcResponse | null> {
+  const workspace = resolveWorkspace(workspaceInput);
   if (!isRecord(message) || Array.isArray(message)) {
     return jsonRpcError(null, -32600, 'Invalid JSON-RPC request.');
   }
@@ -461,7 +465,7 @@ export async function handleMCPMessage(message: unknown): Promise<JsonRpcRespons
       case 'tools/list':
         return jsonRpcResult(id, { tools: MCP_TOOLS });
       case 'tools/call':
-        return jsonRpcResult(id, await callTool(request.params));
+        return jsonRpcResult(id, await callTool(request.params, workspace));
       default:
         return jsonRpcError(id, -32601, `Method not found: ${method}`);
     }
@@ -475,7 +479,9 @@ export async function runMCPServer(
   input: Readable = process.stdin,
   output: Writable = process.stdout,
   errorOutput: Writable = process.stderr,
+  workspaceInput?: WorkspaceInput,
 ): Promise<void> {
+  const workspace = resolveWorkspace(workspaceInput);
   const rl = createInterface({ input, crlfDelay: Infinity, terminal: false });
 
   for await (const line of rl) {
@@ -493,7 +499,7 @@ export async function runMCPServer(
     }
 
     try {
-      const response = await handleMCPMessage(parsed);
+      const response = await handleMCPMessage(parsed, workspace);
       if (response) await writeJsonRpc(output, response);
     } catch (err) {
       const detail = err instanceof Error ? err.stack ?? err.message : String(err);
@@ -528,7 +534,7 @@ function initializeResult(params: unknown): Record<string, unknown> {
   };
 }
 
-async function callTool(params: unknown): Promise<ToolResult> {
+async function callTool(params: unknown, workspace: WorkspaceContext): Promise<ToolResult> {
   if (!isRecord(params) || typeof params.name !== 'string') {
     throw new Error('tools/call requires params.name.');
   }
@@ -540,7 +546,7 @@ async function callTool(params: unknown): Promise<ToolResult> {
 
   const toolArgs = isRecord(params.arguments) ? params.arguments : {};
   try {
-    return await handler(toolArgs);
+    return await handler(toolArgs, workspace);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return toolError(message);

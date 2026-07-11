@@ -57,9 +57,10 @@ passes. Concretely the sandbox:
     comparison is immune to `/tmp` → `/private/tmp` symlink quirks;
   - rejects path traversal and refuses to dereference project symlinks into the
     copy (a copied symlink cannot escape the jail);
-  - excludes `.git` and `dist`, and only *symlinks* a project-local
-    `node_modules` (so checks run without a reinstall, but writes can't reach
-    the real modules tree);
+  - mirrors Git-tracked and non-ignored files, honors `.gitignore` and
+    `.mythosignore`, excludes common secret material, and only *symlinks* a
+    project-local `node_modules` (so checks run without a reinstall, but writes
+    can't reach the real modules tree);
   - caps the mirror at 20,000 files and each check at a 120s timeout;
   - redacts secrets from captured check output before display or receipts;
   - is always removed in a `finally` block.
@@ -69,13 +70,29 @@ A cloned repository's `.mythos/policy.json` cannot, by itself, cause command
 execution. Checks run only on explicit operator opt-in (`--run-checks`) and
 never during `--dry-run`.
 
-**7. Tamper-evident audit trail.**
+**7. Recoverable filesystem transactions.**
+Before the first mutating SWD action, Mythos durably records the batch's
+before-state, intended after-state, rollback backups, and progress under
+`.mythos/transactions/`. On restart, `mythos doctor` reports interrupted
+journals and `mythos doctor --repair` recovers only inactive owners. Recovery
+refuses to overwrite a path that drifted from both the recorded before-state
+and Mythos's exact intended after-state.
+
+**8. Locally tamper-evident audit trail.**
 Receipts and run records store paths, hashes, provider/agent id, budget, git
-state, and verification result — but not raw agent input or file contents.
-`receipts verify` re-hashes current files to detect drift after the fact.
+state, and verification result — but not raw file contents. Receipt appends are
+serialized by a repository-scoped lock and receipt/HEAD files are committed with
+same-directory atomic writes. Verification checks receipt self-integrity before
+opening referenced paths, applies the repository path jail, and streams file
+hashes to detect drift without loading complete targets into memory.
 
 ## What is explicitly OUT of scope (residual risk)
 
+- **The local receipt chain is not an authenticity signature.** It detects
+  accidental edits, gaps, forks, duplicate sequences, and partial local
+  rewrites. An actor able to rewrite every receipt and the local HEAD pointer
+  can construct a new self-consistent chain. Use signed or externally anchored
+  attestations when independent authenticity is required.
 - **Check commands are NOT a security sandbox.** `--check` / `policy.json`
   `checks` run *caller-trusted* shell commands with the local user's
   permissions. The temp-dir isolation protects your real working tree from a

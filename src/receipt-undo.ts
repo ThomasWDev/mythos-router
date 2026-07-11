@@ -28,6 +28,7 @@ import {
   type SWDReceipt,
 } from './receipts.js';
 import { isGitRepo, getCurrentBranch, getLatestHash } from './git.js';
+import { resolveWorkspace, type WorkspaceInput } from './workspace.js';
 
 export type UndoClassification =
   | 'reverse-delete' // original CREATE → reverse by deleting the created file
@@ -72,10 +73,10 @@ export interface UndoOutcome {
 
 const NON_MUTATING_STATUSES = new Set(['failed', 'drift']);
 
-function gitContext(): { branch?: string; commit?: string } | undefined {
-  if (!isGitRepo()) return undefined;
-  const branch = getCurrentBranch();
-  const commit = getLatestHash();
+function gitContext(rootDir: string): { branch?: string; commit?: string } | undefined {
+  if (!isGitRepo(rootDir)) return undefined;
+  const branch = getCurrentBranch(rootDir);
+  const commit = getLatestHash(rootDir);
   const ctx: { branch?: string; commit?: string } = {};
   if (branch && branch !== 'unknown') ctx.branch = branch;
   if (commit && commit !== 'unknown') ctx.commit = commit;
@@ -179,10 +180,14 @@ function classifyFile(
  * Build a reversal plan for a receipt without touching the filesystem.
  * Pure aside from reading current file state via verifyReceipt (read-only).
  */
-export function planUndo(receipt: SWDReceipt, options: { force?: boolean } = {}): UndoPlan {
+export function planUndo(
+  receipt: SWDReceipt,
+  options: { force?: boolean; workspace?: WorkspaceInput } = {},
+): UndoPlan {
+  const workspace = resolveWorkspace(options.workspace);
   const force = options.force === true;
   const integrityOk = verifyReceiptIntegrity(receipt);
-  const verification = verifyReceipt(receipt);
+  const verification = verifyReceipt(receipt, workspace.rootDir);
 
   const items = receipt.files.map((file) =>
     classifyFile(receipt, file, verificationFor(file.path, verification.files), force),
@@ -209,14 +214,15 @@ export function planUndo(receipt: SWDReceipt, options: { force?: boolean } = {})
  */
 export async function executeUndo(
   plan: UndoPlan,
-  options: { apply?: boolean } = {},
+  options: { apply?: boolean; workspace?: WorkspaceInput } = {},
 ): Promise<UndoExecution> {
+  const workspace = resolveWorkspace(options.workspace);
   const apply = options.apply === true;
   const reversalActions = plan.reversible
     .map((item) => item.reversal)
     .filter((action): action is FileAction => action !== undefined);
 
-  const review = reviewActions(reversalActions);
+  const review = reviewActions(reversalActions, workspace.rootDir);
   const blocked = review.blocked.map(({ action, verdict }: { action: FileAction; verdict: ActionRiskVerdict }) => ({
     path: action.path,
     operation: action.operation,
@@ -239,7 +245,12 @@ export async function executeUndo(
     };
   }
 
-  const engine = new SWDEngine({ dryRun: false, strict: true, enableRollback: true });
+  const engine = new SWDEngine({
+    rootDir: workspace.rootDir,
+    dryRun: false,
+    strict: true,
+    enableRollback: true,
+  });
   const result = await engine.run(runnable);
 
   const execution: UndoExecution = {
@@ -254,9 +265,12 @@ export async function executeUndo(
     request: `undo:${plan.receiptId}`,
     summary: `Reverse ${runnable.length} change(s) from receipt ${plan.receiptId}`,
     result,
-    git: gitContext(),
-  });
-  execution.receipt = { id: receipt.id, path: saveSWDReceipt(receipt, false) };
+    git: gitContext(workspace.rootDir),
+  }, workspace.rootDir);
+  execution.receipt = {
+    id: receipt.id,
+    path: saveSWDReceipt(receipt, false, workspace.rootDir),
+  };
 
   return execution;
 }
@@ -264,9 +278,10 @@ export async function executeUndo(
 /** Convenience: plan + execute in one call. */
 export async function undoReceipt(
   receipt: SWDReceipt,
-  options: { apply?: boolean; force?: boolean } = {},
+  options: { apply?: boolean; force?: boolean; workspace?: WorkspaceInput } = {},
 ): Promise<UndoOutcome> {
-  const plan = planUndo(receipt, { force: options.force });
-  const execution = await executeUndo(plan, { apply: options.apply });
+  const workspace = resolveWorkspace(options.workspace);
+  const plan = planUndo(receipt, { force: options.force, workspace });
+  const execution = await executeUndo(plan, { apply: options.apply, workspace });
   return { plan, execution };
 }

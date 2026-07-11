@@ -116,9 +116,9 @@ export function reviewChangedReceipts(cwd: string, changedFiles: ChangedFile[]):
     });
   }
 
-  // Append-only chain verification. Only meaningful when receipts changed in
+  // Local append-only chain verification. Only meaningful when receipts changed in
   // this diff; verifies the full chain present in the checked-out tree so a
-  // deleted, reordered, or forged receipt is caught — not just an in-place edit.
+  // A missing receipt, sequence gap, fork, broken link, or edited receipt is caught — not just an in-place edit.
   let chain = { present: false, ok: true, length: 0 } as ReturnType<typeof verifyReceiptChain>;
   if (receiptFiles.length > 0) {
     chain = verifyReceiptChain(join(cwd, RECEIPTS_DIR));
@@ -128,7 +128,7 @@ export function reviewChangedReceipts(cwd: string, changedFiles: ChangedFile[]):
         severity: 'high',
         title: 'Mythos receipt chain is broken',
         evidence: [chain.reason ?? 'The receipt hash chain failed verification.', `Break near seq ${chain.brokenAt ?? 'unknown'}`],
-        why: 'Receipts are an append-only, hash-chained audit trail. A broken chain means a receipt was deleted, reordered, forged, or edited after the fact — the audit trail can no longer be trusted as complete.',
+        why: 'Receipts are a locally append-only, hash-chained audit trail. A broken chain means the checked-out history has a gap, fork, duplicate sequence, broken link, mismatched tip, or edited record.',
         recommendation: 'Investigate why the receipt chain changed. Restore the removed/edited receipt, or regenerate the chain from fresh Mythos runs if the history was rewritten intentionally.',
       });
     }
