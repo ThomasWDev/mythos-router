@@ -9,6 +9,7 @@ import { createHash } from 'node:crypto';
 import { getDatabaseSync } from './sqlite-loader.js';
 import { MEMORY_FILE, MEMORY_DB_FILE, MEMORY_MAX_LINES } from './config.js';
 import { timestamp, c, info, success, warn, dryRunBadge, theme } from './utils.js';
+import { resolveWorkspace, type WorkspaceInput } from './workspace.js';
 
 // ── Types ────────────────────────────────────────────────────
 export interface MemoryEntry {
@@ -18,12 +19,12 @@ export interface MemoryEntry {
 }
 
 // ── Path resolution ──────────────────────────────────────────
-export function getMemoryPath(): string {
-  return resolve(process.cwd(), MEMORY_FILE);
+export function getMemoryPath(workspaceInput?: WorkspaceInput): string {
+  return resolve(resolveWorkspace(workspaceInput).rootDir, MEMORY_FILE);
 }
 
-export function getDbPath(): string {
-  return resolve(process.cwd(), MEMORY_DB_FILE);
+export function getDbPath(workspaceInput?: WorkspaceInput): string {
+  return resolve(resolveWorkspace(workspaceInput).rootDir, MEMORY_DB_FILE);
 }
 
 // ── Integrity & Signpost Check ────────────────────────────────
@@ -31,8 +32,8 @@ export function getDbPath(): string {
  * Calculates a SHA-256 hash of the entire MEMORY.md file.
  * This is the "Sole Authority" for data integrity.
  */
-function getMemoryHash(): string {
-  const path = getMemoryPath();
+function getMemoryHash(workspaceInput?: WorkspaceInput): string {
+  const path = getMemoryPath(workspaceInput);
   if (!existsSync(path)) return 'none';
   const content = readFileSync(path, 'utf-8');
   return createHash('sha256').update(content).digest('hex');
@@ -47,27 +48,31 @@ function getMemoryHash(): string {
  * 3. Failure Isolation: A database failure MUST NEVER affect system correctness.
  *    If SQLite fails, the system continues with reduced search performance.
  */
-let _db: InstanceType<ReturnType<typeof getDatabaseSync>> | null = null;
+type MemoryDatabase = InstanceType<ReturnType<typeof getDatabaseSync>>;
+const databases = new Map<string, MemoryDatabase>();
 
 /**
  * Returns the open SQLite database instance.
  * Initializes schema and triggers if needed.
  */
-function getDb(): InstanceType<ReturnType<typeof getDatabaseSync>> {
-  if (_db) return _db;
+function getDb(workspaceInput?: WorkspaceInput): MemoryDatabase {
+  const workspace = resolveWorkspace(workspaceInput);
+  const existing = databases.get(workspace.rootDir);
+  if (existing) return existing;
 
   const DatabaseSync = getDatabaseSync();
-  const path = getDbPath();
-  _db = new DatabaseSync(path);
+  const path = getDbPath(workspace);
+  const db = new DatabaseSync(path);
+  databases.set(workspace.rootDir, db);
 
   // WAL mode for better concurrency and safety
-  _db.exec('PRAGMA journal_mode=WAL;');
+  db.exec('PRAGMA journal_mode=WAL;');
 
   /**
    * Authority Rule: SQLite is a derivative index.
    * We use a sync_cache table to store the last known manifest hash of MEMORY.md.
    */
-  _db.exec(`
+  db.exec(`
     CREATE TABLE IF NOT EXISTS sync_cache (
       key TEXT PRIMARY KEY,
       value TEXT
@@ -104,15 +109,15 @@ function getDb(): InstanceType<ReturnType<typeof getDatabaseSync>> {
     END;
   `);
 
-  return _db;
+  return db;
 }
 
 /**
  * Unconditionally rebuilds the SQLite index artifact from MEMORY.md.
  * This is the "Recovery Path" for data integrity.
  */
-export function rebuildIndex(dryRun = false): void {
-  const mdPath = getMemoryPath();
+export function rebuildIndex(dryRun = false, workspaceInput?: WorkspaceInput): void {
+  const mdPath = getMemoryPath(workspaceInput);
   if (!existsSync(mdPath)) return;
 
   if (dryRun) {
@@ -120,8 +125,8 @@ export function rebuildIndex(dryRun = false): void {
     return;
   }
 
-  const db = getDb();
-  const entries = parseMemoryFile();
+  const db = getDb(workspaceInput);
+  const entries = parseMemoryFile(workspaceInput);
 
   // Atomic Reconstruction
   db.exec('BEGIN;');
@@ -139,7 +144,7 @@ export function rebuildIndex(dryRun = false): void {
     }
 
     // Update signpost (The "Truth Hash")
-    const hash = getMemoryHash();
+    const hash = getMemoryHash(workspaceInput);
     db.prepare('INSERT OR REPLACE INTO sync_cache (key, value) VALUES (?, ?)')
       .run('manifest_hash', hash);
 
@@ -152,8 +157,8 @@ export function rebuildIndex(dryRun = false): void {
 }
 
 // ── Initialize MEMORY.md if it doesn't exist ─────────────────
-export function initMemory(dryRun = false): void {
-  const path = getMemoryPath();
+export function initMemory(dryRun = false, workspaceInput?: WorkspaceInput): void {
+  const path = getMemoryPath(workspaceInput);
   if (!existsSync(path)) {
     if (dryRun) {
       console.log(`${dryRunBadge()} ${c.dim}Would create MEMORY.md (not yet initialized)${c.reset}`);
@@ -172,9 +177,9 @@ export function initMemory(dryRun = false): void {
   // Authority Check: Startup-only reconciliation
   if (!dryRun) {
     try {
-      const db = getDb();
+      const db = getDb(workspaceInput);
       const storedHashRow = db.prepare('SELECT value FROM sync_cache WHERE key = ?').get('manifest_hash') as { value: string } | undefined;
-      const currentHash = getMemoryHash();
+      const currentHash = getMemoryHash(workspaceInput);
 
       if (!storedHashRow || storedHashRow.value !== currentHash) {
         if (!storedHashRow) {
@@ -182,7 +187,7 @@ export function initMemory(dryRun = false): void {
         } else {
           warn('Memory index out of sync — rebuilding...');
         }
-        rebuildIndex();
+        rebuildIndex(false, workspaceInput);
       }
     } catch (err: any) {
       warn(`Failed to verify memory index: ${err.message}`);
@@ -191,9 +196,9 @@ export function initMemory(dryRun = false): void {
 }
 
 // ── Append a single entry ────────────────────────────────────
-export function appendEntry(action: string, result: string, dryRun = false): void {
-  initMemory(dryRun);
-  const path = getMemoryPath();
+export function appendEntry(action: string, result: string, dryRun = false, workspaceInput?: WorkspaceInput): void {
+  initMemory(dryRun, workspaceInput);
+  const path = getMemoryPath(workspaceInput);
   const ts = timestamp();
   const sanitizedAction = sanitize(action);
   const sanitizedResult = sanitize(result);
@@ -211,12 +216,12 @@ export function appendEntry(action: string, result: string, dryRun = false): voi
   // 2. Best-effort DB Indexing (Failure Isolated)
   // If this step fails, system correctness is untouched.
   try {
-    const db = getDb();
+    const db = getDb(workspaceInput);
     const insert = db.prepare('INSERT INTO memory (timestamp, action, result) VALUES (?, ?, ?)');
     insert.run(ts, sanitizedAction, sanitizedResult);
 
     // Update Signpost
-    const hash = getMemoryHash();
+    const hash = getMemoryHash(workspaceInput);
     db.prepare('INSERT OR REPLACE INTO sync_cache (key, value) VALUES (?, ?)')
       .run('manifest_hash', hash);
   } catch (err: any) {
@@ -227,9 +232,9 @@ export function appendEntry(action: string, result: string, dryRun = false): voi
 /**
  * Appends a hidden metadata block to MEMORY.md for machine parsing.
  */
-export function appendMetadataBlock(metadata: Record<string, string>, type: string = 'meta', dryRun = false): void {
-  initMemory(dryRun);
-  const path = getMemoryPath();
+export function appendMetadataBlock(metadata: Record<string, string>, type: string = 'meta', dryRun = false, workspaceInput?: WorkspaceInput): void {
+  initMemory(dryRun, workspaceInput);
+  const path = getMemoryPath(workspaceInput);
   
   let block = `\n<!-- mythos:${type}\n`;
   for (const [key, value] of Object.entries(metadata)) {
@@ -248,8 +253,8 @@ export function appendMetadataBlock(metadata: Record<string, string>, type: stri
 
   // Update signpost so the next initMemory() doesn't think the index is out of sync
   try {
-    const db = getDb();
-    const hash = getMemoryHash();
+    const db = getDb(workspaceInput);
+    const hash = getMemoryHash(workspaceInput);
     db.prepare('INSERT OR REPLACE INTO sync_cache (key, value) VALUES (?, ?)')
       .run('manifest_hash', hash);
   } catch {
@@ -282,16 +287,16 @@ function toFtsMatchQuery(query: string): string {
  * Surgical retrieval from the derivative SQLite index using FTS5.
  * Returns ranked results matching the query.
  */
-export function searchMemory(query: string, options?: { createIfMissing?: boolean }): MemoryEntry[] {
+export function searchMemory(query: string, options?: { createIfMissing?: boolean; workspace?: WorkspaceInput }): MemoryEntry[] {
   if (options?.createIfMissing === false) {
-    if (!existsSync(getDbPath())) return [];
+    if (!existsSync(getDbPath(options.workspace))) return [];
   }
 
   const matchQuery = toFtsMatchQuery(query);
   if (matchQuery === '') return [];
 
   try {
-    const db = getDb();
+    const db = getDb(options?.workspace);
     // Use FTS5 ranked search
     const results = db.prepare(`
       SELECT m.* 
@@ -332,8 +337,8 @@ function isMemoryEntryRow(line: string): boolean {
  * Lower-level helper to parse MEMORY.md content directly.
  * Used by rebuildIndex to avoid infinite recursion with initMemory.
  */
-function parseMemoryFile(): MemoryEntry[] {
-  const path = getMemoryPath();
+function parseMemoryFile(workspaceInput?: WorkspaceInput): MemoryEntry[] {
+  const path = getMemoryPath(workspaceInput);
   if (!existsSync(path)) return [];
   const raw = readFileSync(path, 'utf-8');
   const lines = raw.split('\n');
@@ -354,8 +359,8 @@ function parseMemoryFile(): MemoryEntry[] {
   return entries;
 }
 
-function getLatestFileMetadataBlocks(): string[] {
-  const path = getMemoryPath();
+function getLatestFileMetadataBlocks(workspaceInput?: WorkspaceInput): string[] {
+  const path = getMemoryPath(workspaceInput);
   if (!existsSync(path)) return [];
 
   const raw = readFileSync(path, 'utf-8');
@@ -396,8 +401,8 @@ function parseMetadataBody(body: string): Record<string, string> {
 }
 
 // ── Read all entries ─────────────────────────────────────────
-export function readMemory(): { header: string; entries: MemoryEntry[]; raw: string } {
-  const path = getMemoryPath();
+export function readMemory(workspaceInput?: WorkspaceInput): { header: string; entries: MemoryEntry[]; raw: string } {
+  const path = getMemoryPath(workspaceInput);
 
   // Do NOT call initMemory() here — reads must never create files.
   // This ensures dry-run commands stay truly non-mutating.
@@ -408,7 +413,7 @@ export function readMemory(): { header: string; entries: MemoryEntry[]; raw: str
   const raw = readFileSync(path, 'utf-8');
   const lines = raw.split('\n');
 
-  const entries = parseMemoryFile();
+  const entries = parseMemoryFile(workspaceInput);
   const headerLines: string[] = [];
 
   for (const line of lines) {
@@ -426,14 +431,14 @@ export function readMemory(): { header: string; entries: MemoryEntry[]; raw: str
 }
 
 // ── Count entry lines ────────────────────────────────────────
-export function getEntryCount(): number {
-  const { entries } = readMemory();
+export function getEntryCount(workspaceInput?: WorkspaceInput): number {
+  const { entries } = readMemory(workspaceInput);
   return entries.length;
 }
 
 // ── Check if Dream is needed ─────────────────────────────────
-export function needsDream(): boolean {
-  return getEntryCount() > MEMORY_MAX_LINES;
+export function needsDream(workspaceInput?: WorkspaceInput): boolean {
+  return getEntryCount(workspaceInput) > MEMORY_MAX_LINES;
 }
 
 // ── Write compressed memory ──────────────────────────────────
@@ -441,8 +446,9 @@ export function writeCompressedMemory(
   summary: string,
   recentEntries: MemoryEntry[],
   dryRun = false,
+  workspaceInput?: WorkspaceInput,
 ): void {
-  const path = getMemoryPath();
+  const path = getMemoryPath(workspaceInput);
   const ts = timestamp();
 
   let content =
@@ -460,7 +466,7 @@ export function writeCompressedMemory(
     content += `| ${entry.timestamp} | ${entry.action} | ${entry.result} |\n`;
   }
 
-  const preservedFileMetadata = getLatestFileMetadataBlocks();
+  const preservedFileMetadata = getLatestFileMetadataBlocks(workspaceInput);
   if (preservedFileMetadata.length > 0) {
     content += `\n${preservedFileMetadata.join('\n')}\n`;
   }
@@ -476,16 +482,16 @@ export function writeCompressedMemory(
 
   // Rebuild search index to reflect the compressed memory
   try {
-    rebuildIndex();
+    rebuildIndex(false, workspaceInput);
   } catch (err: any) {
     warn(`Failed to rebuild memory index after dream: ${err.message}`);
   }
 }
 
 // ── Get memory context for system prompt injection ───────────
-export function getMemoryContext(maxChars = 4000): string {
+export function getMemoryContext(maxChars = 4000, workspaceInput?: WorkspaceInput): string {
   try {
-    const { raw } = readMemory();
+    const { raw } = readMemory(workspaceInput);
     if (raw.length <= maxChars) return raw;
     // Return the last maxChars characters (most recent context)
     return '…[truncated]\n' + raw.slice(-maxChars);
@@ -495,19 +501,30 @@ export function getMemoryContext(maxChars = 4000): string {
 }
 
 // ── Print memory status ──────────────────────────────────────
-export function printMemoryStatus(): void {
-  const path = getMemoryPath();
+export function printMemoryStatus(workspaceInput?: WorkspaceInput): void {
+  const path = getMemoryPath(workspaceInput);
   if (!existsSync(path)) {
     info(`No MEMORY.md found at ${theme.muted}${path}${c.reset}`);
     return;
   }
-  const { entries, raw } = readMemory();
+  const { entries, raw } = readMemory(workspaceInput);
   const hasSummary = raw.includes('## 💤 Dream Summary');
   console.log(
     `${theme.muted}Memory:${c.reset} ${theme.info}${entries.length}${c.reset} entries` +
     (hasSummary ? ` ${theme.muted}(has dream summary)${c.reset}` : '') +
-    (needsDream() ? ` ${theme.warning}(dream recommended)${c.reset}` : ''),
+    (needsDream(workspaceInput) ? ` ${theme.warning}(dream recommended)${c.reset}` : ''),
   );
+}
+
+export function closeMemoryDatabase(workspaceInput?: WorkspaceInput): void {
+  const workspace = resolveWorkspace(workspaceInput);
+  const db = databases.get(workspace.rootDir);
+  if (!db) return;
+  try {
+    db.close();
+  } finally {
+    databases.delete(workspace.rootDir);
+  }
 }
 
 // ── Sanitize for table ───────────────────────────────────────

@@ -16,6 +16,7 @@ import {
 } from '../action-schema.js';
 import { saveRunRecord } from '../runs.js';
 import { c, error as logError, success as logSuccess, warn as logWarn } from '../utils.js';
+import { resolveWorkspace, type WorkspaceInput } from '../workspace.js';
 
 export interface ExternalAgentInput {
   actions: FileAction[];
@@ -109,13 +110,14 @@ interface ApplyExternalAgentOptions {
   checks?: SandboxCheck[];
   checkTimeoutMs?: number;
   saveRun?: boolean;
+  workspace?: WorkspaceInput;
 }
 
-function getReceiptGitContext(): { branch?: string; commit?: string } | undefined {
-  if (!isGitRepo()) return undefined;
+function getReceiptGitContext(rootDir: string): { branch?: string; commit?: string } | undefined {
+  if (!isGitRepo(rootDir)) return undefined;
 
-  const branch = getCurrentBranch();
-  const commit = getLatestHash();
+  const branch = getCurrentBranch(rootDir);
+  const commit = getLatestHash(rootDir);
   const git = {
     ...(branch && branch !== 'unknown' ? { branch } : {}),
     ...(commit && commit !== 'unknown' ? { commit } : {}),
@@ -170,6 +172,7 @@ function providerForAgent(agentId: string, modelId: string): ReceiptProvider {
 }
 
 export async function applyExternalAgentActions(options: ApplyExternalAgentOptions): Promise<SWDApplyResult> {
+  const workspace = resolveWorkspace(options.workspace);
   const input = parseExternalAgentInput(options.rawInput);
   const actions = input.actions;
   const agentId = options.agentId ?? input.agent?.id ?? 'bring-your-own-agent';
@@ -192,7 +195,7 @@ export async function applyExternalAgentActions(options: ApplyExternalAgentOptio
     if (contractSummary) output.contract = contractSummary;
     if (saveRun && !dryRun) {
       try {
-        output.run = saveRunRecord(output, { request, summary });
+        output.run = saveRunRecord(output, { request, summary }, workspace.rootDir);
       } catch (err) {
         output.runLogError = redactReceiptSecrets(err instanceof Error ? err.message : String(err));
       }
@@ -220,7 +223,7 @@ export async function applyExternalAgentActions(options: ApplyExternalAgentOptio
     });
   }
 
-  const review = reviewActions(actions);
+  const review = reviewActions(actions, workspace.rootDir);
   const rejected = rejectedFromReview(review);
   const approved = options.allowRisky ? [...review.approved, ...review.needsConfirmation.map(({ action }) => action)] : review.approved;
 
@@ -275,6 +278,7 @@ export async function applyExternalAgentActions(options: ApplyExternalAgentOptio
     const sandboxResult = await runActionsInSandbox(approved, {
       checks,
       checkTimeoutMs: options.checkTimeoutMs,
+      cwd: workspace.rootDir,
     });
     sandboxSummary = {
       ran: true,
@@ -319,6 +323,7 @@ export async function applyExternalAgentActions(options: ApplyExternalAgentOptio
     dryRun,
     strict: options.strict ?? true,
     enableRollback: options.enableRollback ?? true,
+    rootDir: workspace.rootDir,
   };
   const engine = new SWDEngine(engineOptions);
   const result = await engine.run(approved);
@@ -348,11 +353,11 @@ export async function applyExternalAgentActions(options: ApplyExternalAgentOptio
       summary: options.summary ?? input.summary ?? summarizeFileActions(approved),
       result,
       provider: providerForAgent(agentId, modelId),
-      git: getReceiptGitContext(),
-    });
+      git: getReceiptGitContext(workspace.rootDir),
+    }, workspace.rootDir);
     output.receipt = {
       id: receipt.id,
-      path: saveSWDReceipt(receipt, false),
+      path: saveSWDReceipt(receipt, false, workspace.rootDir),
     };
   }
 
@@ -464,7 +469,10 @@ function printValidationResult(validation: ReturnType<typeof validateExternalAge
   }
 }
 
-export function resolveSandboxChecks(options: Pick<SWDCommandOptions, 'check' | 'runChecks'>): SandboxCheck[] {
+export function resolveSandboxChecks(
+  options: Pick<SWDCommandOptions, 'check' | 'runChecks'>,
+  workspaceInput?: WorkspaceInput,
+): SandboxCheck[] {
   const checks: SandboxCheck[] = [];
 
   const adHoc = Array.isArray(options.check) ? options.check : [];
@@ -474,7 +482,8 @@ export function resolveSandboxChecks(options: Pick<SWDCommandOptions, 'check' | 
   });
 
   if (options.runChecks) {
-    const policy = loadProjectPolicy();
+    const workspace = resolveWorkspace(workspaceInput);
+    const policy = loadProjectPolicy(workspace.rootDir);
     if (policy.errors.length > 0) {
       throw new Error(`Cannot run declared checks: ${policy.errors.join('; ')}`);
     }
@@ -487,6 +496,7 @@ export function resolveSandboxChecks(options: Pick<SWDCommandOptions, 'check' | 
 }
 
 export async function swdCommand(action = 'apply', options: SWDCommandOptions): Promise<void> {
+  const workspace = resolveWorkspace();
   if (action !== 'apply' && action !== 'validate') {
     const message = `Unknown swd action "${action}". Supported: apply, validate.`;
     if (options.json) console.log(JSON.stringify({ ok: false, error: message }, null, 2));
@@ -509,7 +519,7 @@ export async function swdCommand(action = 'apply', options: SWDCommandOptions): 
       return;
     }
 
-    const checks = resolveSandboxChecks(options);
+    const checks = resolveSandboxChecks(options, workspace);
     if (checks.length > 0 && options.dryRun) {
       logWarn('Checks are skipped in --dry-run (no commands are executed during a preview).');
     }
@@ -526,6 +536,7 @@ export async function swdCommand(action = 'apply', options: SWDCommandOptions): 
       modelId: options.model,
       checks,
       saveRun: options.dryRun ? false : options.runLog ?? true,
+      workspace,
     });
 
     if (options.json) {

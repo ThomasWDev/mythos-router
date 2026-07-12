@@ -6,6 +6,7 @@ import { DEFAULT_IGNORE_PATTERNS, MYTHOSIGNORE_FILE } from '../config.js';
 import { c, heading, success, warn, error, info, hr, dryRunBadge, theme } from '../utils.js';
 import { runCIVerification } from '../ci/verify.js';
 import { printCIVerifyReport } from '../ci/report.js';
+import { resolveWorkspace } from '../workspace.js';
 
 type MemoryEntry = {
   action: string;
@@ -40,11 +41,13 @@ interface VerifyOutcome {
 }
 
 export async function verifyCommand(options: { dryRun?: boolean; ci?: boolean; strict?: boolean; json?: boolean; base?: string } = {}): Promise<void> {
+  const workspace = resolveWorkspace();
   if (options.ci === true) {
     try {
       const report = runCIVerification({
         base: options.base,
         strict: options.strict === true,
+        cwd: workspace.rootDir,
       });
       printCIVerifyReport(report, options.json === true);
       process.exitCode = report.summary.exitCode;
@@ -72,9 +75,9 @@ export async function verifyCommand(options: { dryRun?: boolean; ci?: boolean; s
     console.log(`  ${dryRunBadge()} ${c.dim}Memory writes will be previewed, not executed.${c.reset}\n`);
   }
 
-  const cwd = process.cwd();
+  const cwd = workspace.rootDir;
 
-  initMemory(dryRun);
+  initMemory(dryRun, workspace);
 
   const ignorePatterns = loadIgnorePatterns(cwd);
 
@@ -82,7 +85,7 @@ export async function verifyCommand(options: { dryRun?: boolean; ci?: boolean; s
   const files = walkDirectory(cwd, ignorePatterns);
   console.log(`${c.dim}  Found ${c.cyan}${files.length}${c.dim} files${c.reset}`);
 
-  const { entries, raw } = readMemory();
+  const { entries, raw } = readMemory(workspace);
   console.log(`${c.dim}  Memory has ${c.cyan}${entries.length}${c.dim} entries${c.reset}`);
   console.log();
 
@@ -98,6 +101,7 @@ export async function verifyCommand(options: { dryRun?: boolean; ci?: boolean; s
     `verify: scanned ${files.length} files`,
     `✅ ${counts.verified} ok, ⚠️ ${counts.drifted} drift, ❌ ${counts.missing} missing`,
     dryRun,
+    workspace,
   );
 
   if (counts.drifted > 0 || counts.missing > 0) {

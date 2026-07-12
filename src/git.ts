@@ -37,9 +37,9 @@ function validateCommitMessage(message: string): void {
 /**
  * Checks if the current working directory is inside a Git repository.
  */
-export function isGitRepo(): boolean {
+export function isGitRepo(cwd = process.cwd()): boolean {
   try {
-    execFileSync('git', ['rev-parse', '--is-inside-work-tree'], { stdio: 'ignore' });
+    execFileSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd, stdio: 'ignore' });
     return true;
   } catch {
     return false;
@@ -50,9 +50,9 @@ export function isGitRepo(): boolean {
  * Checks if the current working directory has uncommitted changes.
  * Returns true if 'git status --porcelain' is non-empty.
  */
-export function hasUncommittedChanges(): boolean {
+export function hasUncommittedChanges(cwd = process.cwd()): boolean {
   try {
-    const status = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf-8' }).trim();
+    const status = execFileSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf-8' }).trim();
     return status.length > 0;
   } catch {
     // If git status fails, consider it dirty/unsafe
@@ -63,9 +63,10 @@ export function hasUncommittedChanges(): boolean {
 /**
  * Returns the name of the current active Git branch.
  */
-export function getCurrentBranch(): string {
+export function getCurrentBranch(cwd = process.cwd()): string {
   try {
     return execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+      cwd,
       encoding: 'utf-8',
     }).trim();
   } catch {
@@ -77,10 +78,10 @@ export function getCurrentBranch(): string {
  * Creates and checks out a new Git branch.
  * Validates branch name before execution. Throws on failure.
  */
-export function createAndCheckoutBranch(name: string): void {
+export function createAndCheckoutBranch(name: string, cwd = process.cwd()): void {
   validateBranchName(name);
   try {
-    execFileSync('git', ['checkout', '-b', name], { stdio: 'ignore' });
+    execFileSync('git', ['checkout', '-b', name], { cwd, stdio: 'ignore' });
   } catch (err: any) {
     throw new Error(`Git checkout failed: ${err.message}`);
   }
@@ -101,16 +102,16 @@ function normalizeGitPath(filePath: string): string {
  * unrelated user work during Mythos sandbox auto-commits. If no paths are
  * provided, falls back to the legacy full-tree behavior.
  */
-export function commitChanges(message: string, paths?: string[]): void {
+export function commitChanges(message: string, paths?: string[], cwd = process.cwd()): void {
   validateCommitMessage(message);
   try {
     if (paths && paths.length > 0) {
       const uniquePaths = Array.from(new Set(paths.map(normalizeGitPath)));
-      execFileSync('git', ['add', '--', ...uniquePaths], { stdio: 'ignore' });
+      execFileSync('git', ['add', '--', ...uniquePaths], { cwd, stdio: 'ignore' });
     } else {
-      execFileSync('git', ['add', '-A'], { stdio: 'ignore' });
+      execFileSync('git', ['add', '-A'], { cwd, stdio: 'ignore' });
     }
-    execFileSync('git', ['commit', '-m', message], { stdio: 'ignore' });
+    execFileSync('git', ['commit', '-m', message], { cwd, stdio: 'ignore' });
   } catch (err: any) {
     throw new Error(`Git commit failed: ${err.message}`);
   }
@@ -119,9 +120,9 @@ export function commitChanges(message: string, paths?: string[]): void {
 /**
  * Returns the current HEAD commit hash.
  */
-export function getLatestHash(): string {
+export function getLatestHash(cwd = process.cwd()): string {
   try {
-    return execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
+    return execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf-8' }).trim();
   } catch {
     return 'unknown';
   }

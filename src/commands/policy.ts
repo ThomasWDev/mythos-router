@@ -1,11 +1,13 @@
 import { suggestProjectPolicy, type PolicySuggestionResult } from '../policy-suggestions.js';
 import { c, heading, info, theme, warn } from '../utils.js';
+import { resolveWorkspace } from '../workspace.js';
 
 interface PolicyOptions {
   json?: boolean;
 }
 
 export async function policyCommand(action?: string, options: PolicyOptions = {}): Promise<void> {
+  const workspace = resolveWorkspace();
   const normalizedAction = (action ?? 'suggest').toLowerCase();
 
   if (normalizedAction !== 'suggest') {
@@ -15,7 +17,7 @@ export async function policyCommand(action?: string, options: PolicyOptions = {}
     return;
   }
 
-  const result = suggestProjectPolicy();
+  const result = suggestProjectPolicy(workspace.rootDir);
   if (options.json) {
     console.log(JSON.stringify(result, null, 2));
     return;

@@ -16,13 +16,14 @@ import { c, heading, hr, Spinner, success, info, warn, dryRunBadge } from '../ut
 import { saveSessionMetric } from '../metrics.js';
 import { COST_PER_INPUT_TOKEN, COST_PER_OUTPUT_TOKEN } from '../config.js';
 import { calculateCost } from '../providers/pricing.js';
-import * as path from 'node:path';
+import { resolveWorkspace } from '../workspace.js';
 
 // ── Dream Command ────────────────────────────────────────────
 export async function dreamCommand(options: {
   force?: boolean;
   dryRun?: boolean;
 }): Promise<void> {
+  const workspace = resolveWorkspace();
   const dryRun = options.dryRun === true;
   const startedAt = Date.now();
   console.log(heading('💤 Summarization Dream'));
@@ -30,8 +31,8 @@ export async function dreamCommand(options: {
     console.log(`  ${dryRunBadge()} ${c.dim}Memory writes will be previewed, not executed.${c.reset}\n`);
   }
 
-  initMemory(dryRun);
-  const { entries, raw } = readMemory();
+  initMemory(dryRun, workspace);
+  const { entries, raw } = readMemory(workspace);
   const count = entries.length;
 
   console.log(`${c.dim}  Current entries: ${c.cyan}${count}${c.reset}`);
@@ -97,11 +98,11 @@ export async function dreamCommand(options: {
     const summary = response.text.trim();
 
     // Write compressed memory
-    writeCompressedMemory(summary, toKeep, dryRun);
+    writeCompressedMemory(summary, toKeep, dryRun, workspace);
 
     // Stats
     const beforeSize = raw.length;
-    const { raw: afterRaw } = readMemory();
+    const { raw: afterRaw } = readMemory(workspace);
     const afterSize = afterRaw.length;
     const ratio = ((1 - afterSize / beforeSize) * 100).toFixed(1);
 
@@ -122,6 +123,7 @@ export async function dreamCommand(options: {
       `dream: compressed ${toCompress.length} entries`,
       `✅ ${ratio}% reduction`,
       dryRun,
+      workspace,
     );
     // Save metric
     let costUSD = 0;
@@ -138,7 +140,7 @@ export async function dreamCommand(options: {
     if (!dryRun) {
       saveSessionMetric({
         command: 'dream',
-        project: path.basename(process.cwd()),
+        project: workspace.projectName,
         inputTokens: response.inputTokens,
         outputTokens: response.outputTokens,
         turns: 1,

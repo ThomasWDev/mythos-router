@@ -22,6 +22,7 @@ import {
   type EffortLevel,
 } from './config.js';
 import { c, theme } from './utils.js';
+import { resolveWorkspace, type WorkspaceInput } from './workspace.js';
 
 // ── Re-export Message for backward compatibility ─────────────
 export type { Message } from './providers/types.js';
@@ -42,68 +43,50 @@ export interface MythosResponse {
   };
 }
 
-// ── Singleton Orchestrator ───────────────────────────────────
-let _orchestrator: ProviderOrchestrator | null = null;
+// ── Workspace-scoped Orchestrators ──────────────────────────
+const orchestrators = new Map<string, ProviderOrchestrator>();
 
-export function getOrchestrator(): ProviderOrchestrator {
-  if (!_orchestrator) {
-    const providers = validateProviderKeys();
-    _orchestrator = new ProviderOrchestrator();
+export function getOrchestrator(workspaceInput?: WorkspaceInput): ProviderOrchestrator {
+  const workspace = resolveWorkspace(workspaceInput);
+  const existing = orchestrators.get(workspace.rootDir);
+  if (existing) return existing;
 
-    // Preferred default: Anthropic/Claude when configured.
-    if (providers.anthropic) {
-      _orchestrator.registerProvider(
-        new AnthropicProvider(providers.anthropic),
-        { priority: 0 },
-      );
-    }
+  const providers = validateProviderKeys();
+  const orchestrator = new ProviderOrchestrator(undefined, workspace);
 
-    // BYOK: OpenAI can now be the only configured provider.
-    if (providers.openai) {
-      _orchestrator.registerProvider(
-        new OpenAIProvider({
-          id: 'openai',
-          apiKey: providers.openai,
-          baseUrl: process.env.MYTHOS_OPENAI_BASE_URL?.trim() || 'https://api.openai.com/v1',
-          defaultModel: process.env.MYTHOS_OPENAI_MODEL?.trim() || 'gpt-4o',
-        }),
-        { priority: providers.anthropic ? 1 : 0 },
-      );
-    }
-
-    // BYOK: DeepSeek can now be the only configured provider.
-    if (providers.deepseek) {
-      _orchestrator.registerProvider(
-        new OpenAIProvider({
-          id: 'deepseek',
-          apiKey: providers.deepseek,
-          baseUrl: process.env.MYTHOS_DEEPSEEK_BASE_URL?.trim() || 'https://api.deepseek.com/v1',
-          defaultModel: process.env.MYTHOS_DEEPSEEK_MODEL?.trim() || 'deepseek-chat',
-          supportsThinking: true,
-        }),
-        { priority: providers.anthropic || providers.openai ? 2 : 0 },
-      );
-    }
-
-    // BYOK: Surplus — an OpenAI-compatible inference marketplace (Base).
-    // Same models, routed at a discount. Defaults to Claude Opus 4.8;
-    // override the model/base via MYTHOS_SURPLUS_MODEL / MYTHOS_SURPLUS_BASE_URL.
-    if (providers.surplus) {
-      _orchestrator.registerProvider(
-        new OpenAIProvider({
-          id: 'surplus',
-          apiKey: providers.surplus,
-          baseUrl: process.env.MYTHOS_SURPLUS_BASE_URL?.trim() || 'https://www.surplusintelligence.ai/api/inference/v1',
-          defaultModel: process.env.MYTHOS_SURPLUS_MODEL?.trim() || 'claude-opus-4.8',
-        }),
-        {
-          priority:
-            providers.anthropic || providers.openai || providers.deepseek ? 3 : 0,
-        },
-      );
-    }
+  if (providers.anthropic) {
+    orchestrator.registerProvider(new AnthropicProvider(providers.anthropic), { priority: 0 });
   }
-  return _orchestrator;
+  if (providers.openai) {
+    orchestrator.registerProvider(new OpenAIProvider({
+      id: 'openai',
+      apiKey: providers.openai,
+      baseUrl: process.env.MYTHOS_OPENAI_BASE_URL?.trim() || 'https://api.openai.com/v1',
+      defaultModel: process.env.MYTHOS_OPENAI_MODEL?.trim() || 'gpt-4o',
+    }), { priority: providers.anthropic ? 1 : 0 });
+  }
+  if (providers.deepseek) {
+    orchestrator.registerProvider(new OpenAIProvider({
+      id: 'deepseek',
+      apiKey: providers.deepseek,
+      baseUrl: process.env.MYTHOS_DEEPSEEK_BASE_URL?.trim() || 'https://api.deepseek.com/v1',
+      defaultModel: process.env.MYTHOS_DEEPSEEK_MODEL?.trim() || 'deepseek-chat',
+      supportsThinking: true,
+    }), { priority: providers.anthropic || providers.openai ? 2 : 0 });
+  }
+  if (providers.surplus) {
+    orchestrator.registerProvider(new OpenAIProvider({
+      id: 'surplus',
+      apiKey: providers.surplus,
+      baseUrl: process.env.MYTHOS_SURPLUS_BASE_URL?.trim() || 'https://www.surplusintelligence.ai/api/inference/v1',
+      defaultModel: process.env.MYTHOS_SURPLUS_MODEL?.trim() || 'claude-opus-4.8',
+    }), {
+      priority: providers.anthropic || providers.openai || providers.deepseek ? 3 : 0,
+    });
+  }
+
+  orchestrators.set(workspace.rootDir, orchestrator);
+  return orchestrator;
 }
 
 // ── Legacy getClient() (for direct SDK access if needed) ─────

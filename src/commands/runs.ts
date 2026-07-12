@@ -1,5 +1,6 @@
 import { listRuns, readRun, type RunRecord, type RunSummary } from '../runs.js';
 import { c, error, heading, info, success, theme, warn } from '../utils.js';
+import { resolveWorkspace } from '../workspace.js';
 
 interface RunsOptions {
   limit?: string;
@@ -11,20 +12,21 @@ export async function runsCommand(
   target?: string,
   options: RunsOptions = {},
 ): Promise<void> {
+  const workspace = resolveWorkspace();
   const normalizedAction = (action ?? 'list').toLowerCase();
 
   if (normalizedAction === 'list') {
-    printRunList(parseLimit(options.limit), options.json === true);
+    printRunList(parseLimit(options.limit), options.json === true, workspace.rootDir);
     return;
   }
 
   if (normalizedAction === 'latest') {
-    printRun('latest', options.json === true);
+    printRun('latest', options.json === true, workspace.rootDir);
     return;
   }
 
   if (normalizedAction === 'show') {
-    printRun(target ?? 'latest', options.json === true);
+    printRun(target ?? 'latest', options.json === true, workspace.rootDir);
     return;
   }
 
@@ -33,8 +35,8 @@ export async function runsCommand(
   process.exitCode = 1;
 }
 
-function printRunList(limit: number, asJson: boolean): void {
-  const runs = listRuns(limit);
+function printRunList(limit: number, asJson: boolean, rootDir: string): void {
+  const runs = listRuns(limit, rootDir);
   if (asJson) {
     console.log(JSON.stringify(runs, null, 2));
     return;
@@ -51,8 +53,8 @@ function printRunList(limit: number, asJson: boolean): void {
   }
 }
 
-function printRun(target: string, asJson: boolean): void {
-  const run = readRun(target);
+function printRun(target: string, asJson: boolean, rootDir: string): void {
+  const run = readRun(target, rootDir);
   if (!run) {
     error(`Run not found: ${target}`);
     process.exitCode = 1;

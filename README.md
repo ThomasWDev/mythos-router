@@ -34,7 +34,7 @@ npx mythos-router chat
 
 ## What is this?
 
-**mythos-router** is a local CLI power tool built around **Strict Write Discipline (SWD)**: a verification layer that checks every file operation an AI agent *claims* to perform against the actual filesystem using SHA-256 snapshots. If a claim doesn't match reality, the batch is rolled back so a bad write never half-lands, and successful runs leave a hash-chained, tamper-evident receipt.
+**mythos-router** is a local CLI power tool built around **Strict Write Discipline (SWD)**: a verification layer that checks every file operation an AI agent *claims* to perform against the actual filesystem using SHA-256 snapshots. If a claim doesn't match reality, the batch is rolled back so a bad write never half-lands, and successful runs leave a hash-chained, locally tamper-evident receipt.
 
 The key idea is that **the trust boundary is the filesystem, not the model**. That makes SWD model-agnostic: it ships with a built-in Claude Opus 4.8 agent (`mythos chat` / `mythos run`), but the same engine verifies file actions from *any* agent — GPT, DeepSeek, a local model, or your own script — with no Mythos model key, over stdin/JSON, the SDK, or MCP. See [`examples/verified-writes`](examples/verified-writes/) for a runnable "the agent hallucinated a write, SWD caught it" demo.
 
@@ -47,6 +47,7 @@ Zero slop. Zero hallucinated state. Every write verified.
 | Feature | Description |
 |---------|-------------|
 |  **mythos init** | Single-command project onboarding with environment validation, read-only `--check`, and scaffolding |
+|  **mythos doctor** | Read-only workspace health checks for policies, receipts, sessions, telemetry, filesystem safety, and interrupted SWD transactions; `--repair` only recovers inactive transaction journals |
 |  **mythos learn** | Generate a repo-local `SKILL.md` from detected project structure, scripts, docs, CI, and risk surfaces |
 |  **mythos run** | One-shot prompt mode with inline, file, stdin input, and optional `--provider` BYOK selection: same SWD, budget, skills, branch, and optional test-healing pipeline as chat |
 |  **Multi-Provider BYOK** | Auto-routes between configured Anthropic, DeepSeek, OpenAI, and Surplus keys with circuit breakers; Anthropic is no longer required when another provider is configured |
@@ -57,7 +58,7 @@ Zero slop. Zero hallucinated state. Every write verified.
 |  **Adaptive Thinking** | Opus 4.8 with configurable effort levels (high/medium/low) |
 |  **Strict Write Discipline** | Pre/post filesystem snapshots verify every model or external-agent file claim. Works over text `FILE_ACTION` blocks by default, or native provider tool-calling with `--tools` (Anthropic/OpenAI) — same verification either way, auto-falls back to text |
 |  **Isolated Runs** | `swd apply --check <cmd>` / `--run-checks` test a batch in a throwaway copy and apply it to the real tree only if checks pass — the real tree is never left broken |
-|  **SWD Receipts** | Per-run trust receipts record touched files, hashes, provider/external-agent id, budget, git state, and verification result. Receipts are **hash-chained** (append-only): each links to the previous one, so deletion, reordering, or forgery is detectable — not just in-place edits |
+|  **SWD Receipts** | Per-run trust receipts record touched files, hashes, provider/external-agent id, budget, git state, and verification result. Receipts are **hash-chained** and serialized under a repository lock. Atomic receipt/HEAD writes detect local gaps, reordering, forks, partial edits, and unsynchronized writers; the local chain is tamper-evident, not an external authenticity proof |
 |  **Receipt Undo** | `receipts undo <id\|latest>` replays a verified receipt in reverse — previews by default, `--yes` to apply, drift-gated so it never overwrites newer edits, and produces its own receipt |
 |  **Project Policy** | `.mythos/policy.json` adds enforced repo-local SWD guardrails for sensitive project surfaces |
 |  **Self-Healing Memory** | Authority-based logging with a rebuildable SQLite FTS5 search index *(Node 22+)* |
@@ -301,6 +302,8 @@ cat actions.json | mythos swd apply --stdin --allow-risky --json
 
 When `--check` or `--run-checks` is used, Mythos adds an isolated pre-apply gate. It mirrors the current project into a throwaway temp repo copy, applies the approved actions inside that copy, runs the requested checks there, and only then applies the same actions to the real working tree through SWD. If the temp copy cannot be prepared or any check fails, the real working tree is left untouched.
 
+The mirror follows Git's tracked/untracked view and honors `.gitignore` plus `.mythosignore`. Common secret material such as `.env`, private-key files, credential JSON, and user registry configuration is excluded by default; `.env.example` remains eligible. Existing ignored action targets are copied only when needed to verify the proposed batch and are still blocked when they match a sensitive-file rule.
+
 This is an isolated workspace gate, not an OS or container sandbox. Check commands are trusted shell commands supplied by the user or explicitly enabled from project policy, and they run with the local user's permissions. Use commands you already trust, such as `npm test`, `npm run build`, `npm run lint`, or `npx tsc --noEmit`. `--dry-run` never executes checks.
 
 Accepted input formats:
@@ -426,7 +429,7 @@ mythos receipts verify         # Verify all receipts AND the append-only chain
 mythos receipts --json       # Machine-readable output for tooling
 ```
 
-Every non-dry-run SWD file operation writes a local receipt to `.mythos/receipts/`. Receipts include the request summary, provider or external-agent/model identity, git branch/commit, per-file before/after hashes, rollback status, and verification errors. Built-in `chat`/`run` receipts also include token usage, budget snapshot, active skill packs, and optional `--test-cmd` result. `verify` turns those receipts into a quick drift check for "did the files still match what SWD verified?" and, when run over all receipts, also verifies the **append-only hash chain** — each receipt links to the previous one's hash, so a deleted, reordered, or forged receipt breaks the chain and is reported (the per-receipt integrity hash on its own only catches in-place edits). `--markdown`, `--pr`, or `--format markdown` prints a compact paste-ready receipt summary for PR reviews, especially useful when a write failed or rolled back. Receipts are local by default and gitignored by default. They may include prompts, file paths, provider metadata, skill names, test command names, and a short test output tail. Do not publish raw receipts from private repositories; force-add only when you intentionally want a shared audit trail.
+Every non-dry-run SWD file operation writes a local receipt to `.mythos/receipts/`. Receipts include the request summary, provider or external-agent/model identity, git branch/commit, per-file before/after hashes, rollback status, and verification errors. Built-in `chat`/`run` receipts also include token usage, budget snapshot, active skill packs, and optional `--test-cmd` result. `verify` first checks the receipt's own integrity before opening any referenced workspace path, then streams current file hashes through the same repository path jail used by SWD. When run over all receipts, it also verifies the **local append-only hash chain**. Receipt and HEAD updates use same-directory atomic writes under a repository-scoped lock, so concurrent Mythos processes cannot assign the same sequence or silently fork the chain. Lock ownership includes a random token, PID, hostname, and creation time: live same-host writers are never reaped, dead same-host locks are reclaimed, and malformed or remote-host locks must exceed a stale grace period before recovery. The chain detects local gaps, duplicate sequences, forks, broken links, and mismatched tips; because the receipts and HEAD are stored under the same local account, an attacker able to rewrite the complete store can still manufacture a new self-consistent history. Signed or externally anchored receipts are a separate trust layer. `--markdown`, `--pr`, or `--format markdown` prints a compact paste-ready receipt summary for PR reviews, especially useful when a write failed or rolled back. Receipts are local by default and gitignored by default. They may include prompts, file paths, provider metadata, skill names, test command names, and a short test output tail. Do not publish raw receipts from private repositories; force-add only when you intentionally want a shared audit trail.
 
 ### `mythos verify` — Local Memory Scan + CI Verification
 
@@ -499,13 +502,15 @@ Data is stored locally in `~/.mythos-router/metrics.json`.
 `mythos-router` exposes its Strict Write Discipline engine for programmatic use:
 
 ```typescript
-import { SWDEngine, parseActions } from 'mythos-router';
+import { WorkspaceContext, SWDEngine, parseActions } from 'mythos-router';
+
+// Capture one canonical project identity at the integration boundary.
+const workspace = new WorkspaceContext({ rootDir: process.cwd() });
 
 // 1. Create an engine instance with your preferred options
 const engine = new SWDEngine({
-  // Recommended for embedded/long-running processes: bind SWD to an
-  // explicit repository root instead of relying on a mutable process cwd.
-  rootDir: process.cwd(),
+  // Embedded and parallel callers should always bind operations explicitly.
+  rootDir: workspace.rootDir,
   strict: true,
   enableRollback: true,
   onAction: (action) => console.log(`Executing: ${action.operation} ${action.path}`),
@@ -527,6 +532,14 @@ if (result.success) {
 }
 ```
 
+`WorkspaceContext` canonicalizes the project root once and derives a stable
+project identity from the canonical path. Repository-scoped helpers accept the
+context or its `rootDir`, so embedded or parallel Mythos operations do not rely
+on later `process.cwd()` changes. SWD, sandbox checks, project policy, Git,
+receipts, run records, memory, sessions, skills, MCP tools, and command wiring
+all use the captured workspace boundary. Legacy convenience APIs still default
+to the cwd present when they are invoked.
+
 SWD canonicalizes `rootDir` when the engine is constructed and rejects action
 paths that escape it. Existing symbolic links are not followed in SWD action
 paths; a symlinked target or ancestor is rejected before mutation.
@@ -540,12 +553,25 @@ before-snapshot immediately before commit, refusing to clobber a concurrent edit
 `SWDRunResult.rollbackStatus` distinguishes `not-needed`, `disabled`, `complete`,
 `partial`, and `failed`. When `recoveryRequired` is `true`, committed filesystem
 state remains and should be inspected manually. The legacy `rolledBack` boolean
-remains available for compatibility. Persistent recovery after a process or
-machine crash requires the transaction journal planned for a later hardening
-phase; this release makes each individual CREATE/MODIFY commit atomic.
+remains available for compatibility. Every mutating batch now also creates a durable journal under
+`.mythos/transactions/` before the first write. The journal records before-state
+hashes, intended after-state hashes, rollback backups, and progress markers.
+`mythos doctor` detects interrupted transactions; `mythos doctor --repair`
+restores only files that still match either the recorded before-state or the
+exact Mythos-written after-state, and fails closed on unrelated drift.
 
 
 ---
+
+### `mythos doctor` — Workspace Health and Recovery
+
+```bash
+mythos doctor             # Read-only health report
+mythos doctor --json      # Machine-readable report and exit code
+mythos doctor --repair    # Recover inactive SWD journals only
+```
+
+`doctor` checks the Node version, workspace permissions, fail-closed project policy, receipt store and local chain, scoped session structure, memory files, workspace-scoped provider telemetry, critical symlink surfaces, and persistent SWD transaction journals. The default command does not mutate the repository. `--repair` is intentionally narrow: it recovers inactive interrupted transactions and removes safe terminal journal residue, but never rewrites policies, receipts, sessions, telemetry, or user files speculatively.
 
 ## Architecture
 
@@ -556,10 +582,13 @@ mythos-router/
 │   ├── config.ts        # System prompt + constants + budget defaults + validation
 │   ├── client.ts        # Provider facade (Anthropic/OpenAI/DeepSeek BYOK routing)
 │   ├── budget.ts        # Session budget limiter (token cap, turn cap, progress bar)
+│   ├── workspace.ts     # Canonical immutable project root and state identity
 │   ├── swd.ts           # SWD execution kernel (engine, types, parsing, snapshots)
 │   ├── atomic-writer.ts # Same-directory flushed atomic CREATE/MODIFY commits
+│   ├── transaction-journal.ts # Durable SWD crash recovery records
 │   ├── swd-cli.ts       # SWD terminal presentation (verification output, dry-run)
 │   ├── sandbox.ts       # Isolated temp repo copy gate for external-agent checks
+│   ├── sandbox-files.ts # Ignore-aware, secret-filtered workspace mirroring
 │   ├── receipts.ts      # SWD trust receipt creation, storage, and verification
 │   ├── skills.ts        # Project-local and user-global SKILL.md packs
 │   ├── learn.ts         # Deterministic repo skill generator
@@ -576,6 +605,7 @@ mythos-router/
 │   └── commands/
 │       ├── chat.ts      # Interactive REPL (ChatSession + ChatUI abstraction)
 │       ├── init.ts      # Project onboarding and read-only setup checks
+│       ├── doctor.ts    # Workspace health and transaction recovery command
 │       ├── verify.ts    # Codebase ↔ Memory scanner (dry-run aware)
 │       ├── swd.ts       # External-agent SWD apply command
 │       ├── mcp.ts       # MCP stdio server command
@@ -714,7 +744,7 @@ When the budget is reached, mythos doesn't just kill your session — it perform
   Disable limits:  mythos chat --no-budget
 ```
 
-The system automatically saves your conversation history and budget state to `~/.mythos-router/sessions/latest.json`. Session format v2 preserves structured assistant tool calls and tool results, while existing valid v1 text-only sessions are migrated when loaded. Malformed or incomplete tool histories are rejected rather than sent back to a provider. You can restore the saved context with `mythos chat --resume`.
+The system automatically saves conversation history and budget state under `~/.mythos-router/sessions/<project-id>/latest.json`, where `<project-id>` combines the project name with a digest of its canonical root. Repositories with the same directory name therefore cannot resume one another's session. Session format v2 preserves structured assistant tool calls and tool results. A matching legacy `~/.mythos-router/sessions/latest.json` v1/v2 session is migrated one way into the scoped location when loaded. Malformed or incomplete tool histories are rejected rather than sent back to a provider. Restore the scoped context with `mythos chat --resume`.
 
 Token counts, estimated cost, and budget status are displayed after every chat response.
 

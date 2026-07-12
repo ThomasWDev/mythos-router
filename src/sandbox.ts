@@ -20,12 +20,10 @@
 // ─────────────────────────────────────────────────────────────
 
 import {
-  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -34,14 +32,10 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative } from 'node:path';
 import { runTestCommand } from './utils.js';
 import { SWDEngine, type FileAction } from './swd.js';
-
-// Names skipped when mirroring the tree (regenerable or symlinked).
-const EXCLUDED_DIR_NAMES = new Set(['.git', 'node_modules', 'dist']);
-
-// Guardrail against mirroring a pathological tree into temp.
-const MAX_SANDBOX_FILES = 20_000;
+import { mirrorWorkspaceForSandbox } from './sandbox-files.js';
 
 const DEFAULT_CHECK_TIMEOUT_MS = 120_000;
+
 
 export interface SandboxCheck {
   name: string;
@@ -72,50 +66,6 @@ export interface SandboxRunResult {
 
 const CHECK_OUTPUT_TAIL_MAX = 1200;
 
-/**
- * Recursively mirror `src` into `dest`, skipping excluded directory names.
- * Returns the number of files copied. Throws if the file cap is exceeded.
- */
-function mirrorTree(src: string, dest: string): number {
-  let copied = 0;
-
-  const walk = (fromDir: string, toDir: string): void => {
-    const entries = readdirSync(fromDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (EXCLUDED_DIR_NAMES.has(entry.name)) continue;
-
-      const fromPath = join(fromDir, entry.name);
-      const toPath = join(toDir, entry.name);
-
-      if (entry.isSymbolicLink()) {
-        // Do not dereference repository symlinks into the sandbox. A link may
-        // point outside the project, and importing that target would surprise
-        // both the check runner and supply-chain scanners.
-        continue;
-      }
-
-      if (entry.isDirectory()) {
-        mkdirSync(toPath, { recursive: true });
-        walk(fromPath, toPath);
-      } else if (entry.isFile()) {
-        if (++copied > MAX_SANDBOX_FILES) {
-          throw new Error(
-            `Project exceeds the sandbox file cap (${MAX_SANDBOX_FILES}). ` +
-            `Add large directories to .gitignore/.mythosignore or skip isolated runs.`,
-          );
-        }
-        // Real file contents only. No dereference flag: symlinks were already
-        // excluded above, so there is no link for cpSync to follow.
-        cpSync(fromPath, toPath);
-      }
-      // Symlinks, sockets, FIFOs, and devices are intentionally not mirrored.
-    }
-  };
-
-  walk(src, dest);
-  return copied;
-}
-
 /** Symlink the real node_modules into the sandbox so checks need no reinstall. */
 function linkNodeModules(root: string, sandbox: string): void {
   const realModules = join(root, 'node_modules');
@@ -137,17 +87,15 @@ function linkNodeModules(root: string, sandbox: string): void {
 
 /** Apply approved actions inside the sandbox through the authoritative SWD engine. */
 async function applyActionsInSandbox(sandbox: string, actions: FileAction[]): Promise<void> {
-  const previousCwd = process.cwd();
-  try {
-    process.chdir(sandbox);
-    const engine = new SWDEngine({ enableRollback: true, strict: true });
-    const result = await engine.run(actions);
-    if (!result.success || result.rolledBack) {
-      const detail = result.errors.length > 0 ? result.errors.join('; ') : 'unknown SWD failure';
-      throw new Error(`Sandbox jail/apply failed: ${detail}`);
-    }
-  } finally {
-    process.chdir(previousCwd);
+  const engine = new SWDEngine({
+    rootDir: sandbox,
+    enableRollback: true,
+    strict: true,
+  });
+  const result = await engine.run(actions);
+  if (!result.success || result.rolledBack) {
+    const detail = result.errors.length > 0 ? result.errors.join('; ') : 'unknown SWD failure';
+    throw new Error(`Sandbox jail/apply failed: ${detail}`);
   }
 }
 
@@ -169,7 +117,8 @@ export async function runActionsInSandbox(
   const sandbox = realpathSync(mkdtempSync(join(tmpdir(), 'mythos-sandbox-')));
 
   try {
-    const filesCopied = mirrorTree(root, sandbox);
+    const mirror = mirrorWorkspaceForSandbox(root, sandbox, actions);
+    const filesCopied = mirror.filesCopied;
     linkNodeModules(root, sandbox);
     await applyActionsInSandbox(sandbox, actions);
 

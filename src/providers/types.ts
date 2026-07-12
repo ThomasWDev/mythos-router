@@ -126,9 +126,15 @@ export type ProviderStatus = 'healthy' | 'degraded' | 'down';
 // ── Base Provider Interface ──────────────────────────────────
 // Every LLM backend MUST implement this contract.
 // The orchestrator never touches raw provider APIs directly.
+export interface ProviderTelemetryIdentity {
+  modelId: string;
+  endpointHash: string;
+}
+
 export interface BaseProvider {
   readonly id: string;
   readonly capabilities: ReadonlySet<ProviderCapability>;
+  readonly telemetryIdentity?: ProviderTelemetryIdentity;
 
   streamMessage(
     messages: Message[],

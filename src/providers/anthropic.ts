@@ -7,6 +7,7 @@
 // ─────────────────────────────────────────────────────────────
 
 import Anthropic from '@anthropic-ai/sdk';
+import { createHash } from 'node:crypto';
 import {
   type BaseProvider,
   type Message,
@@ -15,6 +16,7 @@ import {
   type UnifiedResponse,
   type ProviderCapability,
   type RequestOptions,
+  type ProviderTelemetryIdentity,
 } from './types.js';
 import { toAnthropicTool, extractAnthropicToolCalls } from './tools.js';
 import { normalizeMessages } from './messages.js';
@@ -37,6 +39,10 @@ type ContentDelta = ThinkingDelta | TextDelta;
 // ── Anthropic Provider ───────────────────────────────────────
 export class AnthropicProvider implements BaseProvider {
   readonly id = 'anthropic';
+  readonly telemetryIdentity: ProviderTelemetryIdentity = {
+    modelId: 'effort-routed',
+    endpointHash: createHash('sha256').update('https://api.anthropic.com').digest('hex').slice(0, 16),
+  };
   readonly capabilities: ReadonlySet<ProviderCapability> = new Set([
     'thinking',
     'streaming',

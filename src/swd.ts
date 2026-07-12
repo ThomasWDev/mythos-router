@@ -8,6 +8,7 @@ import { createHash } from 'node:crypto';
 import { isSafeRelativePathShape } from './path-safety.js';
 import { PathJail } from './path-jail.js';
 import { AtomicFileWriter } from './atomic-writer.js';
+import { SWDTransactionJournal } from './transaction-journal.js';
 
 // ── Public Types ─────────────────────────────────────────────
 export type ActionIntent = 'MUTATE' | 'NOOP' | 'UNKNOWN';
@@ -230,11 +231,19 @@ export class SWDEngine {
     const results: ActionResult[] = [];
     const rollbackErrors: string[] = [];
     let overallSuccess = true;
+    let journal: SWDTransactionJournal | null = null;
 
     try {
       // 1. PLAN + SNAPSHOT_BEFORE
       for (const action of actions) {
         context.getSnapshot(action.path, 'before');
+      }
+      if (!this.options.dryRun) {
+        journal = SWDTransactionJournal.create(
+          this.pathJail.root,
+          actions,
+          context.snapshots.before,
+        );
       }
 
       // 2. EXECUTE
@@ -247,7 +256,9 @@ export class SWDEngine {
         for (const action of actions) {
           this.options.onAction(action);
           try {
-            this.executeAction(action, context);
+            journal?.markApplying(action);
+            this.executeAction(action, context, journal);
+            if (context.wasCommitted(action)) journal?.markApplied(action);
           } catch (err: any) {
             executionError = err instanceof Error ? err.message : String(err);
             overallSuccess = false;
@@ -284,6 +295,7 @@ export class SWDEngine {
       // Skipped when execution already threw — there is nothing more to verify,
       // and the partially-applied batch is about to be rolled back.
       if (!executionError) {
+        journal?.markVerifying();
         for (const action of actions) {
           // In dry run, we cannot verify filesystem outcomes.
           if (this.options.dryRun) {
@@ -317,6 +329,7 @@ export class SWDEngine {
       // 4. ROLLBACK
       const rollback = this.resolveRollbackOutcome(overallSuccess, context);
       rollbackErrors.push(...rollback.errors);
+      this.finalizeJournal(journal, overallSuccess, rollback.status, rollback.errors);
 
       return {
         success: overallSuccess,
@@ -334,6 +347,7 @@ export class SWDEngine {
 
       const rollback = this.resolveRollbackOutcome(false, context);
       rollbackErrors.push(...rollback.errors);
+      this.finalizeJournal(journal, false, rollback.status, rollback.errors);
 
       const resultErrors = results
         .filter(result => result.status === 'failed' || result.status === 'drift')
@@ -349,6 +363,24 @@ export class SWDEngine {
         errors: [...new Set([...resultErrors, message])],
       };
     }
+  }
+
+  private finalizeJournal(
+    journal: SWDTransactionJournal | null,
+    success: boolean,
+    rollbackStatus: SWDRollbackStatus,
+    rollbackErrors: string[],
+  ): void {
+    if (!journal) return;
+    if (success) {
+      journal.finish('committed');
+      return;
+    }
+    if (rollbackStatus === 'complete' || rollbackStatus === 'not-needed') {
+      journal.finish('rolled-back');
+      return;
+    }
+    journal.finish('recovery-required', rollbackErrors);
   }
 
   private validateActionPaths(actions: FileAction[]): ActionResult[] {
@@ -418,7 +450,11 @@ export class SWDEngine {
     }
   }
 
-  private executeAction(action: FileAction, ctx: InternalSessionContext): void {
+  private executeAction(
+    action: FileAction,
+    ctx: InternalSessionContext,
+    journal: SWDTransactionJournal | null,
+  ): void {
     try {
       let absPath = this.pathJail.resolve(action.path);
       const before = ctx.getSnapshot(action.path, 'before');
@@ -432,7 +468,10 @@ export class SWDEngine {
 
           this.pathJail.ensureParentDirectories(
             absPath,
-            directory => ctx.recordCreatedDir(directory),
+            directory => {
+              ctx.recordCreatedDir(directory);
+              journal?.recordCreatedDirectory(directory);
+            },
           );
           absPath = this.pathJail.resolve(action.path);
 
@@ -756,6 +795,10 @@ class InternalSessionContext {
     // before the verification pass, rollback must not treat a subsequent
     // external edit as the state Mythos itself wrote.
     this.getSnapshot(action.path, 'after');
+  }
+
+  public wasCommitted(action: FileAction): boolean {
+    return this.logs.executionOrder.includes(action);
   }
 
   public getCachedAfterSnapshot(path: string): FileSnapshot {

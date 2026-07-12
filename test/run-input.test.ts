@@ -82,6 +82,18 @@ describe('resolveRunPrompt', () => {
     });
   });
 
+  it('resolves prompt files against an explicit workspace root', async () => {
+    await withTempCwd(async (root) => {
+      writeFileSync('prompt.txt', 'workspace prompt');
+      await withTempCwd(async () => {
+        assert.equal(
+          await resolveRunPrompt('', { file: 'prompt.txt' }, root),
+          'workspace prompt',
+        );
+      });
+    });
+  });
+
   it('reports a clear error for a missing file', async () => {
     await withTempCwd(async () => {
       await assert.rejects(() => resolveRunPrompt('', { file: 'nope.txt' }), /Unable to read prompt file/);

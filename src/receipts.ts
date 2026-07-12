@@ -1,18 +1,30 @@
 import { createHash } from 'node:crypto';
 import {
   existsSync,
-  mkdirSync,
+  lstatSync,
   readdirSync,
-  readFileSync,
   realpathSync,
-  statSync,
-  writeFileSync,
+  unlinkSync,
 } from 'node:fs';
 import * as path from 'node:path';
+import { withFileLockSync } from './file-lock.js';
+import { PathJail } from './path-jail.js';
+import {
+  atomicWriteTextInJail,
+  digestJailedRegularFile,
+  readRegularTextFileNoFollow,
+} from './safe-file-io.js';
 import type { SWDRollbackStatus, SWDRunResult } from './swd.js';
 
 export const RECEIPTS_DIR = '.mythos/receipts';
+export const RECEIPT_STORE_LOCK_FILE = '.receipt-store.lock';
 
+const RECEIPT_ID_PATTERN = /^swd-[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/;
+const MAX_RECEIPT_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_CHAIN_HEAD_BYTES = 64 * 1024;
+const RECEIPT_FILE_MODE = 0o600;
+const CHAIN_VERIFY_WAIT_MS = 5_000;
+const CHAIN_VERIFY_RETRY_MS = 10;
 
 export const RECEIPT_OUTPUT_TAIL_MAX_CHARS = 500;
 
@@ -113,6 +125,8 @@ export interface ReceiptFileVerification {
 }
 
 export interface ReceiptVerification {
+  /** Receipt self-integrity is checked before any referenced workspace path is opened. */
+  integrityOk: boolean;
   ok: boolean;
   files: ReceiptFileVerification[];
 }
@@ -176,9 +190,10 @@ export interface SWDReceipt {
    * Append-only hash-chain linkage. `seq` is the receipt's position in the
    * chain (genesis = 0); `prevHash` is the integrity hash of the receipt at
    * `seq - 1` (empty string for genesis). Both fields are part of the hashed
-   * payload, so editing either one breaks `integrity.sha256` — which is what
-   * makes deletion, reordering, and forgery detectable rather than just
-   * in-place edits.
+   * payload, so editing either one breaks `integrity.sha256`. Together with
+   * the local HEAD pointer this detects accidental edits, gaps, reordering, and
+   * unsynchronized writers. It is not an authenticity proof against an actor
+   * that can rewrite the complete local chain and HEAD.
    */
   chain?: ReceiptChain;
   integrity?: {
@@ -298,18 +313,19 @@ function resolveReceiptPath(rootDir: string, filePath: string): string {
   return path.isAbsolute(nativePath) ? nativePath : path.resolve(rootDir, nativePath);
 }
 
-function getCurrentRoot(): string {
-  return process.cwd();
-}
-
-export function getReceiptsDir(rootDir = getCurrentRoot()): string {
+export function getReceiptsDir(rootDir = process.cwd()): string {
   return path.join(rootDir, RECEIPTS_DIR);
 }
 
-function ensureReceiptsDir(): string {
-  const dir = getReceiptsDir();
-  mkdirSync(dir, { recursive: true });
-  return dir;
+function ensureReceiptsDir(rootDir = process.cwd()): { dir: string; jail: PathJail } {
+  const jail = new PathJail(rootDir);
+  const sentinel = path.join(RECEIPTS_DIR, '.receipt-store-sentinel');
+  jail.ensureParentDirectories(sentinel);
+  const dir = getReceiptsDir(jail.root);
+  // Resolve a child path so PathJail verifies every existing directory
+  // component, including `.mythos/receipts`, without requiring a sentinel file.
+  jail.resolve(sentinel);
+  return { dir, jail };
 }
 
 function normalizeSnapshot(rootDir: string, snapshot?: SnapshotLike): ReceiptSnapshot | undefined {
@@ -400,8 +416,7 @@ function normalizeUsage(usage?: SWDReceiptInput['usage']): ReceiptUsage | undefi
   };
 }
 
-export function createSWDReceipt(input: SWDReceiptInput): SWDReceipt {
-  const rootDir = getCurrentRoot();
+export function createSWDReceipt(input: SWDReceiptInput, rootDir = process.cwd()): SWDReceipt {
   const timestamp = new Date().toISOString();
   const files = input.result.results.map((result) => normalizeFileResult(rootDir, result));
   const safeRequest = redactReceiptSecrets(input.request);
@@ -437,54 +452,123 @@ export function createSWDReceipt(input: SWDReceiptInput): SWDReceipt {
   return withIntegrity(base);
 }
 
-export function saveSWDReceipt(receipt: SWDReceipt, overwrite = true): string {
-  const rootDir = getCurrentRoot();
-  const dir = ensureReceiptsDir();
-  const filePath = path.join(dir, `${receipt.id}.json`);
-  const alreadyExists = existsSync(filePath);
+export function saveSWDReceipt(receipt: SWDReceipt, overwrite = true, rootDir = process.cwd()): string {
+  assertReceiptId(receipt.id);
+  const { dir, jail } = ensureReceiptsDir(rootDir);
+  const relativeReceiptPath = path.join(RECEIPTS_DIR, `${receipt.id}.json`);
+  const relativeLockPath = path.join(RECEIPTS_DIR, RECEIPT_STORE_LOCK_FILE);
+  const filePath = jail.resolve(relativeReceiptPath);
+  const lockPath = jail.resolve(relativeLockPath);
 
-  if (!overwrite && alreadyExists) {
-    return filePath;
-  }
+  return withFileLockSync(lockPath, () => {
+    // A writer that acquired the lock still revalidates the store path. This
+    // catches a receipts directory or target swapped to a symlink after setup.
+    jail.resolve(relativeLockPath);
+    jail.resolve(relativeReceiptPath);
 
-  // Determine chain linkage.
-  //  - New receipt: link it to the current tip (genesis if none) and advance HEAD.
-  //  - Re-save of an existing receipt: preserve its stored chain and leave HEAD
-  //    alone, so an idempotent rewrite never re-sequences or relinks the chain.
-  let chain = receipt.chain;
-  let advanceHead = false;
-  if (alreadyExists) {
-    const stored = readReceiptFile(filePath);
-    chain = stored?.chain ?? receipt.chain;
-  } else if (!chain) {
-    const head = readChainHead(dir);
-    chain = {
+    const alreadyExists = existsSync(filePath);
+    if (alreadyExists) {
+      const stored = readReceiptFile(filePath);
+      if (!stored || !verifyReceiptIntegrity(stored)) {
+        throw new Error(`Refusing to reuse unreadable or integrity-invalid receipt ${receipt.id}.`);
+      }
+
+      const payload = normalizedReceiptPayload(jail.root, receipt, stored.chain);
+      const normalized = withIntegrity(payload);
+      if (normalized.integrity?.sha256 === stored.integrity?.sha256) {
+        return filePath;
+      }
+
+      const reason = overwrite
+        ? 'receipt storage is append-only'
+        : 'an existing receipt with the same id has different content';
+      throw new Error(`Refusing to reuse existing receipt ${receipt.id}: ${reason}.`);
+    }
+
+    const chainState = verifyReceiptChainUnlocked(dir);
+    if (chainState.present && !chainState.ok) {
+      throw new Error(`Refusing to append to a broken receipt chain: ${chainState.reason}`);
+    }
+
+    const headState = inspectChainHead(dir);
+    if (headState.exists && !headState.head) {
+      throw new Error('Refusing to append: receipt chain HEAD is unreadable or invalid.');
+    }
+    const head = headState.head;
+    const chain: ReceiptChain = {
       seq: head ? head.seq + 1 : 0,
       prevHash: head ? head.hash : GENESIS_PREV_HASH,
     };
-    advanceHead = true;
-  }
 
+    const normalized = withIntegrity(normalizedReceiptPayload(jail.root, receipt, chain));
+    const serializedReceipt = `${JSON.stringify(normalized, null, 2)}\n`;
+    atomicWriteTextInJail(jail, relativeReceiptPath, serializedReceipt, {
+      createOnly: true,
+      defaultMode: RECEIPT_FILE_MODE,
+    });
+
+    const nextHead: ChainHead = {
+      id: normalized.id,
+      seq: chain.seq,
+      hash: normalized.integrity!.sha256,
+      updatedAt: new Date().toISOString(),
+    };
+    const relativeHeadPath = path.join(RECEIPTS_DIR, CHAIN_HEAD_FILE);
+    const headPath = jail.resolve(relativeHeadPath);
+    const previousHeadContent = existsSync(headPath)
+      ? readRegularTextFileNoFollow(headPath, MAX_CHAIN_HEAD_BYTES)
+      : null;
+
+    try {
+      atomicWriteTextInJail(jail, relativeHeadPath, `${JSON.stringify(nextHead, null, 2)}
+`, {
+        createOnly: previousHeadContent === null,
+        defaultMode: RECEIPT_FILE_MODE,
+        expectedExistingContent: previousHeadContent,
+        maxExistingBytes: MAX_CHAIN_HEAD_BYTES,
+      });
+    } catch (error: unknown) {
+      // Keep the two-file append transaction consistent when the process is
+      // still alive. A process crash between these commits remains detectable
+      // by chain verification and is addressed by the later journal phase.
+      removeReceiptIfUnchanged(filePath, normalized.integrity!.sha256);
+      throw error;
+    }
+
+    return filePath;
+  });
+}
+
+function normalizedReceiptPayload(
+  rootDir: string,
+  receipt: SWDReceipt,
+  chain: ReceiptChain | undefined,
+): Omit<SWDReceipt, 'integrity'> {
   const payload: Omit<SWDReceipt, 'integrity'> = {
     ...receiptPayload(receipt),
     files: receipt.files.map((file) => normalizeStoredFile(rootDir, file)),
     skills: receipt.skills?.map((skill) => normalizeReceiptSkill(rootDir, skill)),
   };
   if (chain) payload.chain = chain;
+  else delete payload.chain;
+  return payload;
+}
 
-  const normalized = withIntegrity(payload);
-  writeFileSync(filePath, `${JSON.stringify(normalized, null, 2)}\n`, 'utf-8');
-
-  if (advanceHead && chain && normalized.integrity) {
-    writeChainHead(dir, {
-      id: normalized.id,
-      seq: chain.seq,
-      hash: normalized.integrity.sha256,
-      updatedAt: new Date().toISOString(),
-    });
+function removeReceiptIfUnchanged(filePath: string, expectedHash: string): void {
+  try {
+    const stored = readReceiptFile(filePath);
+    if (stored?.integrity?.sha256 !== expectedHash || !verifyReceiptIntegrity(stored)) return;
+    unlinkSync(filePath);
+  } catch {
+    // Preserve the original HEAD commit failure. Chain verification will report
+    // any receipt that could not be removed and is not represented by HEAD.
   }
+}
 
-  return filePath;
+function assertReceiptId(receiptId: string): void {
+  if (!RECEIPT_ID_PATTERN.test(receiptId)) {
+    throw new Error(`Invalid receipt id '${receiptId}'.`);
+  }
 }
 
 function normalizeStoredFile(rootDir: string, file: ReceiptFileResult): ReceiptFileResult {
@@ -514,41 +598,153 @@ function receiptFilesIn(dir: string): string[] {
     // the chain-head pointer and any other JSON that isn't a receipt.
     .filter((entry) => entry.startsWith('swd-') && entry.endsWith('.json'))
     .map((entry) => path.join(dir, entry))
-    .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+    .sort((a, b) => safeLstatMtime(b) - safeLstatMtime(a));
 }
 
-function receiptFiles(): string[] {
-  return receiptFilesIn(getReceiptsDir());
+function safeLstatMtime(filePath: string): number {
+  try {
+    return lstatSync(filePath).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+function receiptFiles(rootDir = process.cwd()): string[] {
+  return receiptFilesIn(getReceiptsDir(rootDir));
 }
 
 function chainHeadPath(dir: string): string {
   return path.join(dir, CHAIN_HEAD_FILE);
 }
 
-function readChainHead(dir: string): ChainHead | null {
-  const filePath = chainHeadPath(dir);
-  if (!existsSync(filePath)) return null;
-  try {
-    const parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as ChainHead;
-    if (typeof parsed?.seq === 'number' && typeof parsed?.hash === 'string' && typeof parsed?.id === 'string') {
-      return parsed;
-    }
-    return null;
-  } catch {
-    return null;
-  }
+interface ChainHeadInspection {
+  exists: boolean;
+  head: ChainHead | null;
 }
 
-function writeChainHead(dir: string, head: ChainHead): void {
-  writeFileSync(chainHeadPath(dir), `${JSON.stringify(head, null, 2)}\n`, 'utf-8');
+function inspectChainHead(dir: string): ChainHeadInspection {
+  const filePath = chainHeadPath(dir);
+  if (!existsSync(filePath)) return { exists: false, head: null };
+  try {
+    const parsed = JSON.parse(readRegularTextFileNoFollow(filePath, MAX_CHAIN_HEAD_BYTES)) as Partial<ChainHead>;
+    if (
+      typeof parsed.id === 'string'
+      && RECEIPT_ID_PATTERN.test(parsed.id)
+      && Number.isSafeInteger(parsed.seq)
+      && (parsed.seq ?? -1) >= 0
+      && typeof parsed.hash === 'string'
+      && /^[a-f0-9]{64}$/.test(parsed.hash)
+      && typeof parsed.updatedAt === 'string'
+      && Number.isFinite(Date.parse(parsed.updatedAt))
+    ) {
+      return { exists: true, head: parsed as ChainHead };
+    }
+  } catch {
+    // Report invalid JSON through the explicit inspection result.
+  }
+  return { exists: true, head: null };
 }
 
 function readReceiptFile(filePath: string): SWDReceipt | null {
   try {
-    return JSON.parse(readFileSync(filePath, 'utf-8')) as SWDReceipt;
+    const parsed = JSON.parse(readRegularTextFileNoFollow(filePath, MAX_RECEIPT_FILE_BYTES)) as unknown;
+    return isStoredReceipt(parsed) ? parsed : null;
   } catch {
     return null;
   }
+}
+
+function isStoredReceipt(value: unknown): value is SWDReceipt {
+  if (!isPlainRecord(value)) return false;
+  const receipt = value as Partial<SWDReceipt>;
+  if (
+    typeof receipt.id !== 'string'
+    || receipt.version !== 1
+    || typeof receipt.timestamp !== 'string'
+    || !Number.isFinite(Date.parse(receipt.timestamp))
+    || typeof receipt.request !== 'string'
+    || typeof receipt.summary !== 'string'
+    || !Number.isSafeInteger(receipt.fileCount)
+    || (receipt.fileCount ?? -1) < 0
+    || !Array.isArray(receipt.files)
+    || receipt.fileCount !== receipt.files.length
+    || !receipt.files.every(isReceiptFileResult)
+    || !isPlainRecord(receipt.swd)
+  ) {
+    return false;
+  }
+
+  const swd = receipt.swd;
+  if (
+    typeof swd.success !== 'boolean'
+    || typeof swd.rolledBack !== 'boolean'
+    || !isStringArray(swd.errors)
+    || !isStringArray(swd.rollbackErrors)
+  ) {
+    return false;
+  }
+
+  if (receipt.chain !== undefined && (
+    !isPlainRecord(receipt.chain)
+    || !Number.isSafeInteger(receipt.chain.seq)
+    || receipt.chain.seq < 0
+    || typeof receipt.chain.prevHash !== 'string'
+  )) {
+    return false;
+  }
+  if (receipt.integrity !== undefined && (
+    !isPlainRecord(receipt.integrity)
+    || typeof receipt.integrity.sha256 !== 'string'
+  )) {
+    return false;
+  }
+  if (receipt.skills !== undefined && (
+    !Array.isArray(receipt.skills)
+    || !receipt.skills.every((skill) => isPlainRecord(skill)
+      && typeof skill.id === 'string'
+      && typeof skill.name === 'string'
+      && typeof skill.version === 'string'
+      && ['project', 'global', 'path'].includes(String(skill.source))
+      && (skill.path === undefined || typeof skill.path === 'string'))
+  )) {
+    return false;
+  }
+  return true;
+}
+
+function isReceiptFileResult(value: unknown): value is ReceiptFileResult {
+  if (!isPlainRecord(value)) return false;
+  return typeof value.path === 'string'
+    && typeof value.operation === 'string'
+    && typeof value.intent === 'string'
+    && typeof value.status === 'string'
+    && typeof value.detail === 'string'
+    && ['before', 'after', 'none'].includes(String(value.expectedSource))
+    && isOptionalReceiptSnapshot(value.before)
+    && isOptionalReceiptSnapshot(value.after)
+    && isOptionalReceiptSnapshot(value.expected);
+}
+
+function isOptionalReceiptSnapshot(value: unknown): value is ReceiptSnapshot | undefined {
+  if (value === undefined) return true;
+  if (!isPlainRecord(value)) return false;
+  return typeof value.path === 'string'
+    && typeof value.exists === 'boolean'
+    && typeof value.size === 'number'
+    && Number.isFinite(value.size)
+    && value.size >= 0
+    && typeof value.mtime === 'number'
+    && Number.isFinite(value.mtime)
+    && value.mtime >= 0
+    && typeof value.sha256 === 'string';
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string');
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function isWithinReceiptsDir(dir: string, candidate: string): boolean {
@@ -560,11 +756,11 @@ function isWithinReceiptsDir(dir: string, candidate: string): boolean {
   return rel.length > 0 && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
-function receiptPathFor(target: string): string | null {
-  const files = receiptFiles();
+function receiptPathFor(target: string, rootDir = process.cwd()): string | null {
+  const files = receiptFiles(rootDir);
   if (target === 'latest') return files[0] ?? null;
 
-  const dir = getReceiptsDir();
+  const dir = getReceiptsDir(rootDir);
   const id = target.endsWith('.json') ? target.slice(0, -5) : target;
 
   // Build candidates, then require each to resolve *inside* the receipts dir.
@@ -585,13 +781,13 @@ function receiptPathFor(target: string): string | null {
   return null;
 }
 
-export function readReceipt(target = 'latest'): SWDReceipt | null {
-  const filePath = receiptPathFor(target);
+export function readReceipt(target = 'latest', rootDir = process.cwd()): SWDReceipt | null {
+  const filePath = receiptPathFor(target, rootDir);
   return filePath ? readReceiptFile(filePath) : null;
 }
 
-export function listReceipts(limit = 10): ReceiptSummary[] {
-  return receiptFiles()
+export function listReceipts(limit = 10, rootDir = process.cwd()): ReceiptSummary[] {
+  return receiptFiles(rootDir)
     .slice(0, limit)
     .map((filePath) => readReceiptFile(filePath))
     .filter((receipt): receipt is SWDReceipt => receipt !== null)
@@ -616,38 +812,56 @@ export function listReceipts(limit = 10): ReceiptSummary[] {
  * `limit`. Unlike `listReceipts`, this returns the complete file-action detail,
  * which callers such as skill-learning need to inspect verification outcomes.
  */
-export function readReceipts(limit = 50): SWDReceipt[] {
-  return receiptFiles()
+export function readReceipts(limit = 50, rootDir = process.cwd()): SWDReceipt[] {
+  return receiptFiles(rootDir)
     .slice(0, limit)
     .map((filePath) => readReceiptFile(filePath))
     .filter((receipt): receipt is SWDReceipt => receipt !== null);
 }
 
-function snapshotCurrentFile(rootDir: string, filePath: string): ReceiptSnapshot {
-  const absolutePath = resolveReceiptPath(rootDir, filePath);
-  if (!existsSync(absolutePath)) {
-    return {
-      path: filePath,
-      exists: false,
-      size: 0,
-      mtime: 0,
-      sha256: '',
-    };
-  }
-
-  const stat = statSync(absolutePath);
-  const content = readFileSync(absolutePath);
+function snapshotCurrentFile(jail: PathJail, filePath: string): ReceiptSnapshot {
+  const digest = digestJailedRegularFile(jail, filePath);
   return {
     path: filePath,
-    exists: true,
-    size: stat.size,
-    mtime: stat.mtimeMs,
-    sha256: sha256(content),
+    exists: digest.exists,
+    size: digest.size,
+    mtime: digest.mtimeMs,
+    sha256: digest.sha256,
   };
 }
 
-export function verifyReceipt(receipt: SWDReceipt): ReceiptVerification {
-  const rootDir = getCurrentRoot();
+export function verifyReceipt(receipt: SWDReceipt, rootDir = process.cwd()): ReceiptVerification {
+  const integrityOk = verifyReceiptIntegrity(receipt);
+  if (!integrityOk) {
+    return {
+      integrityOk: false,
+      ok: false,
+      files: receipt.files.map((file) => ({
+        path: file.path,
+        status: 'unknown',
+        detail: 'Receipt integrity check failed; referenced workspace paths were not opened.',
+        expected: file.expected,
+      })),
+    };
+  }
+
+  let jail: PathJail;
+  try {
+    jail = new PathJail(rootDir);
+  } catch (error: unknown) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return {
+      integrityOk: true,
+      ok: false,
+      files: receipt.files.map((file) => ({
+        path: file.path,
+        status: 'unknown',
+        detail: `Unable to establish the project verification boundary: ${detail}`,
+        expected: file.expected,
+      })),
+    };
+  }
+
   const files = receipt.files.map((file): ReceiptFileVerification => {
     const expected = file.expected;
 
@@ -659,7 +873,28 @@ export function verifyReceipt(receipt: SWDReceipt): ReceiptVerification {
       };
     }
 
-    const actual = snapshotCurrentFile(rootDir, file.path);
+    if (expected.path !== file.path) {
+      return {
+        path: file.path,
+        status: 'unknown',
+        detail: 'Receipt file path does not match its expected snapshot path.',
+        expected,
+      };
+    }
+
+    let actual: ReceiptSnapshot;
+    try {
+      actual = snapshotCurrentFile(jail, file.path);
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return {
+        path: file.path,
+        status: 'unknown',
+        detail: `Receipt target could not be verified safely: ${detail}`,
+        expected,
+      };
+    }
+
     if (expected.exists && !actual.exists) {
       return {
         path: file.path,
@@ -700,96 +935,224 @@ export function verifyReceipt(receipt: SWDReceipt): ReceiptVerification {
   });
 
   return {
+    integrityOk: true,
     ok: files.every((file) => file.status === 'ok'),
     files,
   };
 }
 
 export function verifyReceiptIntegrity(receipt: SWDReceipt): boolean {
-  return receipt.integrity?.sha256 === integrityHash(receipt);
+  try {
+    return typeof receipt.integrity?.sha256 === 'string'
+      && /^[a-f0-9]{64}$/.test(receipt.integrity.sha256)
+      && receipt.integrity.sha256 === integrityHash(receipt);
+  } catch {
+    return false;
+  }
 }
 
 /**
- * Verify the append-only receipt chain in `dir`.
+ * Verify the locally append-only receipt chain in `dir`.
  *
- * Per-receipt `integrity.sha256` (which now covers the `chain` fields) catches
- * in-place edits. On top of that, the chain catches the things a self-hash
- * cannot:
- *   - **deletion / insertion** → a gap in the contiguous `seq` run;
- *   - **reordering / forgery**  → a `prevHash` that doesn't match the previous
- *     receipt's integrity hash;
- *   - **tip replacement**       → a HEAD pointer that doesn't match the latest
- *     receipt.
+ * This detects malformed records, duplicate sequences, local forks, gaps,
+ * broken links, edits, and a missing/mismatched HEAD pointer. Because both the
+ * receipts and HEAD live under the same local account, this is tamper-evidence
+ * for accidental or partial history changes — not cryptographic authenticity
+ * against an actor able to rewrite the complete store.
  *
  * Receipts written before chaining was introduced have no `chain` field and are
- * ignored, so upgrading an existing repo simply starts a fresh chain rather than
- * reporting every legacy receipt as broken.
+ * ignored, so upgrading an existing repo starts a new local chain at seq 0.
  */
 export function verifyReceiptChain(dir = getReceiptsDir()): ChainVerification {
-  const chained = receiptFilesIn(dir)
-    .map((filePath) => readReceiptFile(filePath))
-    .filter((receipt): receipt is SWDReceipt => receipt !== null)
-    .filter((receipt) => receipt.chain !== undefined)
-    .sort((a, b) => a.chain!.seq - b.chain!.seq);
+  if (!existsSync(dir)) return verifyReceiptChainUnlocked(dir);
 
-  if (chained.length === 0) {
-    return { present: false, ok: true, length: 0 };
+  const lockPath = path.join(dir, RECEIPT_STORE_LOCK_FILE);
+  const deadline = Date.now() + CHAIN_VERIFY_WAIT_MS;
+  while (true) {
+    if (!existsSync(lockPath)) {
+      const headBefore = chainHeadFingerprint(dir);
+      const verification = verifyReceiptChainUnlocked(dir);
+      const headAfter = chainHeadFingerprint(dir);
+      if (!existsSync(lockPath) && headBefore === headAfter) return verification;
+    }
+
+    if (Date.now() >= deadline) {
+      return {
+        present: receiptFilesIn(dir).length > 0 || existsSync(chainHeadPath(dir)),
+        ok: false,
+        length: 0,
+        brokenAt: 0,
+        reason: 'Receipt store remained busy while chain verification waited for an active writer.',
+      };
+    }
+    sleepForChainVerification(CHAIN_VERIFY_RETRY_MS);
   }
+}
 
-  const broken = (brokenAt: number, reason: string, headMatches?: boolean): ChainVerification => ({
+function chainHeadFingerprint(dir: string): string {
+  const filePath = chainHeadPath(dir);
+  if (!existsSync(filePath)) return 'missing';
+  try {
+    return sha256(readRegularTextFileNoFollow(filePath, MAX_CHAIN_HEAD_BYTES));
+  } catch {
+    try {
+      const stat = lstatSync(filePath);
+      return `invalid:${stat.size}:${stat.mtimeMs}`;
+    } catch {
+      return 'missing';
+    }
+  }
+}
+
+function sleepForChainVerification(milliseconds: number): void {
+  const signal = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(signal, 0, 0, milliseconds);
+}
+
+function verifyReceiptChainUnlocked(dir: string): ChainVerification {
+  const files = receiptFilesIn(dir);
+  const headState = inspectChainHead(dir);
+  const chained: Array<{ filePath: string; receipt: SWDReceipt }> = [];
+
+  const broken = (
+    brokenAt: number,
+    reason: string,
+    headMatches?: boolean,
+    length = chained.length,
+  ): ChainVerification => ({
     present: true,
     ok: false,
-    length: chained.length,
+    length,
     brokenAt,
     reason,
     headMatches,
   });
 
-  // The chain must begin at genesis; a non-zero first seq means the earliest
-  // receipts were removed.
-  const first = chained[0].chain!;
+  for (const filePath of files) {
+    const receipt = readReceiptFile(filePath);
+    if (!receipt) {
+      return broken(0, `Receipt file ${path.basename(filePath)} is unreadable or invalid JSON.`);
+    }
+
+    const expectedFilename = `${receipt.id}.json`;
+    if (!RECEIPT_ID_PATTERN.test(receipt.id) || path.basename(filePath) !== expectedFilename) {
+      return broken(
+        receipt.chain?.seq ?? 0,
+        `Receipt filename/id mismatch for ${path.basename(filePath)}.`,
+      );
+    }
+
+    if (receipt.chain === undefined) continue;
+    if (
+      !Number.isSafeInteger(receipt.chain.seq)
+      || receipt.chain.seq < 0
+      || typeof receipt.chain.prevHash !== 'string'
+      || (receipt.chain.prevHash !== '' && !/^[a-f0-9]{64}$/.test(receipt.chain.prevHash))
+    ) {
+      return broken(receipt.chain.seq ?? 0, `Receipt ${receipt.id} has invalid chain metadata.`);
+    }
+
+    chained.push({ filePath, receipt });
+  }
+
+  if (chained.length === 0) {
+    if (headState.exists) {
+      return broken(0, 'Receipt chain HEAD exists, but no chained receipts are present.', false, 0);
+    }
+    return { present: false, ok: true, length: 0 };
+  }
+
+  if (!headState.exists) {
+    return broken(
+      Math.max(...chained.map(({ receipt }) => receipt.chain!.seq)),
+      'Receipt chain HEAD is missing while chained receipts are present.',
+      false,
+    );
+  }
+  if (!headState.head) {
+    return broken(0, 'Receipt chain HEAD is unreadable or invalid.', false);
+  }
+
+  chained.sort((left, right) => {
+    const seqDifference = left.receipt.chain!.seq - right.receipt.chain!.seq;
+    return seqDifference !== 0 ? seqDifference : left.receipt.id.localeCompare(right.receipt.id);
+  });
+
+  const seenSequences = new Map<number, string>();
+  const seenIds = new Set<string>();
+  const childrenByPrevHash = new Map<string, string>();
+  for (const { receipt } of chained) {
+    const seq = receipt.chain!.seq;
+    const priorAtSequence = seenSequences.get(seq);
+    if (priorAtSequence) {
+      return broken(seq, `Duplicate chain sequence ${seq} is used by ${priorAtSequence} and ${receipt.id}.`);
+    }
+    seenSequences.set(seq, receipt.id);
+
+    if (seenIds.has(receipt.id)) {
+      return broken(seq, `Duplicate receipt id ${receipt.id} appears in the chain.`);
+    }
+    seenIds.add(receipt.id);
+
+    if (seq > 0) {
+      const existingChild = childrenByPrevHash.get(receipt.chain!.prevHash);
+      if (existingChild) {
+        return broken(
+          seq,
+          `Receipt chain fork: ${existingChild} and ${receipt.id} share the same prevHash.`,
+        );
+      }
+      childrenByPrevHash.set(receipt.chain!.prevHash, receipt.id);
+    }
+  }
+
+  const first = chained[0]!.receipt.chain!;
   if (first.seq !== 0) {
     return broken(0, `The earliest receipts are missing — the chain starts at seq ${first.seq} instead of genesis (seq 0).`);
   }
   if (first.prevHash !== GENESIS_PREV_HASH) {
-    return broken(0, 'The genesis receipt has a non-empty prevHash, so it was not the true start of the chain.');
+    return broken(0, 'The genesis receipt has a non-empty prevHash, so it is not a valid chain start.');
   }
 
   let prevHash: string | null = null;
   let expectedSeq = 0;
-  for (const receipt of chained) {
+  for (const { receipt } of chained) {
     const seq = receipt.chain!.seq;
 
     if (!verifyReceiptIntegrity(receipt)) {
       return broken(seq, `Receipt ${receipt.id} (seq ${seq}) was edited after creation — its integrity hash no longer matches.`);
     }
     if (seq !== expectedSeq) {
-      return broken(expectedSeq, `Chain gap at seq ${expectedSeq}: a receipt was deleted, reordered, or inserted.`);
+      return broken(expectedSeq, `Chain gap at seq ${expectedSeq}: a receipt is missing or out of order.`);
     }
     if (prevHash !== null && receipt.chain!.prevHash !== prevHash) {
       return broken(seq, `Broken link at seq ${seq}: prevHash does not match the previous receipt's hash.`);
     }
 
     prevHash = receipt.integrity!.sha256;
-    expectedSeq++;
+    expectedSeq += 1;
   }
 
-  const head = readChainHead(dir);
-  const tip = chained[chained.length - 1];
-  const headMatches = head !== null
-    && head.id === tip.id
+  const head = headState.head;
+  const tip = chained[chained.length - 1]!.receipt;
+  const headMatches = head.id === tip.id
     && head.seq === tip.chain!.seq
     && head.hash === tip.integrity!.sha256;
 
-  if (head !== null && !headMatches) {
+  if (!headMatches) {
     return broken(
       tip.chain!.seq,
-      'The chain HEAD pointer does not match the latest receipt — the most recent receipt may have been deleted or replaced.',
-      headMatches,
+      'The chain HEAD pointer does not match the latest receipt — the tip may be missing, replaced, or incompletely committed.',
+      false,
     );
   }
 
-  return { present: true, ok: true, length: chained.length, headMatches };
+  return { present: true, ok: true, length: chained.length, headMatches: true };
+}
+
+
+function isMissingPathError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && 'code' in error && error.code === 'ENOENT';
 }
 
 export const createReceipt = createSWDReceipt;

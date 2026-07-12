@@ -70,6 +70,26 @@ export {
   extractOpenAIToolCalls,
 } from './providers/tools.js';
 
+
+export {
+  WorkspaceContext,
+  createWorkspaceContext,
+  resolveWorkspace,
+  type WorkspaceContextOptions,
+  type WorkspaceInput,
+} from './workspace.js';
+
+export {
+  saveSession,
+  loadSession,
+  getSessionPaths,
+  parseSessionData,
+  serializeSessionData,
+  formatResumeInfo,
+  type SessionData,
+  type SessionPaths,
+} from './session.js';
+
 // Export the Strict Write Discipline Engine (v1 API — Pure Kernel)
 export {
   SWDEngine,
@@ -94,7 +114,21 @@ export {
 export { printSWDResults, dryRunSWD, printVerboseParse } from './swd-cli.js';
 
 // Export the Self-Healing Memory
-export { readMemory, writeCompressedMemory, initMemory, appendEntry, needsDream, getMemoryContext, type MemoryEntry } from './memory.js';
+export {
+  readMemory,
+  writeCompressedMemory,
+  initMemory,
+  appendEntry,
+  appendMetadataBlock,
+  needsDream,
+  getMemoryContext,
+  getMemoryPath,
+  getDbPath,
+  getEntryCount,
+  searchMemory,
+  closeMemoryDatabase,
+  type MemoryEntry,
+} from './memory.js';
 
 // Export the Deterministic Cache
 export { ResponseCache, generateCacheKey, type CacheKeyInput } from './cache.js';
@@ -295,3 +329,25 @@ export {
   type MCPConfigClient,
   type MCPServerConfig,
 } from './mcp-config.js';
+
+// Export persistent transaction recovery and workspace diagnostics
+export {
+  SWDTransactionJournal,
+  inspectTransactionJournals,
+  recoverInterruptedTransactions,
+  type TransactionState,
+  type TransactionEntryState,
+  type TransactionFileState,
+  type TransactionEntry,
+  type TransactionJournalData,
+  type TransactionInspection,
+  type TransactionRecoveryResult,
+} from './transaction-journal.js';
+export {
+  runDoctor,
+  type DoctorCheckStatus,
+  type DoctorCheck,
+  type DoctorReport,
+  type DoctorOptions,
+} from './doctor.js';
+export { mirrorWorkspaceForSandbox } from './sandbox-files.js';

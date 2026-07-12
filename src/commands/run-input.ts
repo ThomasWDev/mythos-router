@@ -17,7 +17,11 @@ import type { ChatOptions, RunOptions } from './chat-types.js';
  * Resolve the single prompt source for a run: inline argument, `--file`, or
  * `--stdin`. Exactly one must be provided; zero or multiple is a usage error.
  */
-export async function resolveRunPrompt(prompt: string, options: RunOptions): Promise<string> {
+export async function resolveRunPrompt(
+  prompt: string,
+  options: RunOptions,
+  rootDir = process.cwd(),
+): Promise<string> {
   const inlinePrompt = prompt.trim();
   const hasInlinePrompt = inlinePrompt.length > 0;
   const hasFilePrompt = typeof options.file === 'string' && options.file.trim().length > 0;
@@ -35,7 +39,7 @@ export async function resolveRunPrompt(prompt: string, options: RunOptions): Pro
   if (hasFilePrompt) {
     const filePath = options.file!.trim();
     try {
-      return normalizePromptContent(readFileSync(resolveSafePath(filePath), 'utf-8'), `prompt file ${filePath}`);
+      return normalizePromptContent(readFileSync(resolveSafePath(filePath, rootDir), 'utf-8'), `prompt file ${filePath}`);
     } catch (err: any) {
       throw new Error(`Unable to read prompt file ${filePath}: ${err.message}`);
     }

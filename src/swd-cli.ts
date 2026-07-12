@@ -5,7 +5,7 @@
 
 import { c, dryRunBadge, verboseBadge, confirmPrompt, theme, icon } from './utils.js';
 import { renderDiff } from './diff.js';
-import { parseActions, snapshotFile, type FileAction, type SWDRunResult } from './swd.js';
+import { parseActions, resolveSafePath, snapshotFile, type FileAction, type SWDRunResult } from './swd.js';
 import { reviewActions } from './security-policy.js';
 
 // ── Print verification results to terminal ───────────────────
@@ -60,12 +60,12 @@ ${theme.warning}${icon.rollback} TRANSACTION ROLLBACK${c.reset}`);
 }
 
 // ── Interactive dry-run preview with diffs ────────────────────
-export async function dryRunSWD(actions: FileAction[]): Promise<{ accepted: FileAction[], rejected: FileAction[] }> {
+export async function dryRunSWD(actions: FileAction[], rootDir = process.cwd()): Promise<{ accepted: FileAction[], rejected: FileAction[] }> {
   if (actions.length === 0) return { accepted: [], rejected: [] };
   console.log(`\n${dryRunBadge()} ${c.bold}── File Action Preview ──${c.reset}\n`);
   const accepted: FileAction[] = [];
   const rejected: FileAction[] = [];
-  const review = reviewActions(actions);
+  const review = reviewActions(actions, rootDir);
   for (let i = 0; i < actions.length; i++) {
     const action = actions[i]!;
     const blocked = review.blocked.find((item) => item.action === action);
@@ -78,7 +78,7 @@ export async function dryRunSWD(actions: FileAction[]): Promise<{ accepted: File
     }
 
     const needsConfirmation = review.needsConfirmation.find((item) => item.action === action);
-    const snap = snapshotFile(action.path);
+    const snap = snapshotFile(resolveSafePath(action.path, rootDir));
     console.log(`  ${c.bold}${i + 1}/${actions.length}${c.reset} ${c.cyan}${action.operation}${c.reset} ${action.path}`);
     console.log(`  ${c.dim}Intent: ${action.intent} | ${action.description}${c.reset}`);
     if (needsConfirmation) {
