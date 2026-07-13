@@ -112,10 +112,11 @@ export class SWDTransactionJournal {
     snapshots: ReadonlyMap<string, FileSnapshot>,
   ): SWDTransactionJournal | null {
     const jail = new PathJail(rootDir);
+    const canonicalSnapshots = normalizeSnapshots(jail, snapshots);
     const writable = actions.filter(
       (action): action is FileAction & { operation: Exclude<FileAction['operation'], 'READ'> } => {
         if (action.operation === 'READ') return false;
-        const before = snapshots.get(jail.resolve(action.path));
+        const before = canonicalSnapshots.get(jail.resolve(action.path));
         if (!before) return false;
         if (action.operation === 'CREATE') return !before.exists && action.content !== undefined;
         if (action.operation === 'MODIFY') return before.exists && action.content !== undefined;
@@ -138,7 +139,7 @@ export class SWDTransactionJournal {
     const now = new Date().toISOString();
     const entries: TransactionEntry[] = writable.map((action, index) => {
       const absolutePath = jail.resolve(action.path);
-      const before = snapshots.get(absolutePath);
+      const before = canonicalSnapshots.get(absolutePath);
       if (!before) throw new Error(`Missing before-snapshot for transaction path ${action.path}.`);
       const expectedAfter = expectedAfterState(action);
       const entry: TransactionEntry = {
@@ -176,7 +177,7 @@ export class SWDTransactionJournal {
     try {
       for (const entry of entries) {
         if (!entry.backupFile) continue;
-        const before = snapshots.get(jail.resolve(entry.path))!;
+        const before = canonicalSnapshots.get(jail.resolve(entry.path))!;
         journal.writeBackup(entry.backupFile, before.content!);
       }
       journal.persist(true);
@@ -536,6 +537,29 @@ function validateFileState(state: TransactionFileState, label: string): void {
   } else if (state.size !== 0 || state.hash !== '' || state.mode !== null) {
     throw new Error(`Journal missing ${label} must be empty.`);
   }
+}
+
+function normalizeSnapshots(
+  jail: PathJail,
+  snapshots: ReadonlyMap<string, FileSnapshot>,
+): Map<string, FileSnapshot> {
+  const canonical = new Map<string, FileSnapshot>();
+
+  for (const [snapshotKey, snapshot] of snapshots) {
+    const canonicalKey = jail.resolve(snapshotKey);
+    const canonicalSnapshotPath = jail.resolve(snapshot.path);
+    if (canonicalKey !== canonicalSnapshotPath) {
+      throw new Error(
+        `Snapshot key '${snapshotKey}' does not match snapshot path '${snapshot.path}'.`,
+      );
+    }
+    if (canonical.has(canonicalKey)) {
+      throw new Error(`Duplicate before-snapshot for transaction path '${canonicalKey}'.`);
+    }
+    canonical.set(canonicalKey, { ...snapshot, path: canonicalKey });
+  }
+
+  return canonical;
 }
 
 function expectedAfterState(action: FileAction): Pick<TransactionFileState, 'exists' | 'hash'> {

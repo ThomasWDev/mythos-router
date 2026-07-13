@@ -1,5 +1,13 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -24,6 +32,34 @@ function snapshots(root: string, actions: FileAction[]): Map<string, ReturnType<
 }
 
 describe('SWD transaction journal recovery', () => {
+  it(
+    'normalizes snapshot paths created through a workspace root alias',
+    { skip: process.platform === 'win32' },
+    () => withTempDir((parent) => {
+      const actualRoot = join(parent, 'actual');
+      const aliasRoot = join(parent, 'alias');
+      mkdirSync(actualRoot);
+      symlinkSync(actualRoot, aliasRoot, 'dir');
+
+      const target = join(aliasRoot, 'file.txt');
+      writeFileSync(target, 'before', 'utf8');
+      const action: FileAction = {
+        path: 'file.txt',
+        operation: 'MODIFY',
+        intent: 'MUTATE',
+        content: 'after',
+      };
+      const journal = SWDTransactionJournal.create(
+        aliasRoot,
+        [action],
+        snapshots(aliasRoot, [action]),
+      );
+
+      assert.ok(journal);
+      journal.finish('rolled-back');
+    }),
+  );
+
   it('restores a modified file after an interrupted applied action', () => withTempDir((root) => {
     const target = join(root, 'file.txt');
     writeFileSync(target, 'before', 'utf8');

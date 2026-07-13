@@ -1,6 +1,6 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -28,7 +28,10 @@ import {
 const tempRoots: string[] = [];
 
 function tempDir(prefix: string): string {
-  const dir = mkdtempSync(join(tmpdir(), prefix));
+  // macOS exposes /var through the canonical /private/var path. process.cwd()
+  // returns the canonical path after chdir(), so canonicalize temporary roots
+  // at creation time before comparing or deriving workspace identities.
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
   tempRoots.push(dir);
   return dir;
 }
